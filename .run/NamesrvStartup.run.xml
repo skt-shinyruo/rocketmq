@@ -5,6 +5,7 @@
     </envs>
     <option name="MAIN_CLASS_NAME" value="org.apache.rocketmq.namesrv.NamesrvStartup" />
     <module name="rocketmq-namesrv" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
     <extension name="coverage">
       <pattern>
         <option name="PATTERN" value="org.apache.rocketmq.namesrv.*" />

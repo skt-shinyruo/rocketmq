@@ -5,7 +5,8 @@
     </envs>
     <option name="MAIN_CLASS_NAME" value="org.apache.rocketmq.broker.BrokerStartup" />
     <module name="rocketmq-broker" />
-    <option name="PROGRAM_PARAMETERS" value="-n 127.0.0.1:9876 -c $PROJECT_DIR$/distribution/conf/broker.conf " />
+    <option name="PROGRAM_PARAMETERS" value="-n 127.0.0.1:9876 -c $PROJECT_DIR$/distribution/conf/broker.conf" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
     <extension name="coverage">
       <pattern>
         <option name="PATTERN" value="org.apache.rocketmq.broker.*" />
