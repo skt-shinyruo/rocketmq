@@ -1,0 +1,18 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Consumer" type="Application" factoryName="Application" nameIsGenerated="true">
+    <envs>
+      <env name="NAMESRV_ADDR" value="127.0.0.1:9876" />
+    </envs>
+    <option name="MAIN_CLASS_NAME" value="org.apache.rocketmq.example.quickstart.Consumer" />
+    <module name="rocketmq-example" />
+    <extension name="coverage">
+      <pattern>
+        <option name="PATTERN" value="org.apache.rocketmq.example.quickstart.*" />
+        <option name="ENABLED" value="true" />
+      </pattern>
+    </extension>
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>
