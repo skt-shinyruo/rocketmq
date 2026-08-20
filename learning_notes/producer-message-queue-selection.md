@@ -70,6 +70,18 @@ index = threadLocalIndex.incrementAndGet() % messageQueueList.size();
 - 每选择一次递增；
 - 有过滤器时最多扫描整个队列列表一轮。
 
+`ThreadLocalIndex` 本质上是线程私有的轮询游标。它通过 `ThreadLocal<Integer>` 保存
+当前线程的索引，因此多个发送线程共享同一个 `ThreadLocalIndex` 对象时，仍然各自递增，
+互不影响，也不需要使用 `AtomicInteger` 竞争同一个计数值。
+
+线程首次调用 `incrementAndGet()` 时会从随机值开始，避免多个发送线程总是同时从队列
+列表的第一个位置起步。每次递增后，结果会与 `0x7FFFFFFF` 做按位与，从而在 `int`
+溢出后仍返回非负数，能够继续安全地用于取模。`reset()` 也只会把当前线程的游标重置到
+一个新的随机位置。
+
+因此，它适合队列轮询，但不是全局计数器：它不保证跨线程单调递增，也不能用于生成
+唯一 ID。
+
 第一次发送时，`lastBrokerName` 为 `null`，所有队列都符合条件，因此实际效果是从一个
 随机起点开始轮询。
 

@@ -191,27 +191,131 @@ Broker 路由模型定义在：
 路由对象定义在：
 [TopicRouteData.java](../remoting/src/main/java/org/apache/rocketmq/remoting/protocol/route/TopicRouteData.java)。
 
-### 3.6 这些数据最终怎么使用
+### 3.6 `brokerName` 如何解析为 Broker 地址
 
-客户端通过 `MQClientInstance.updateTopicRouteInfoFromNameServer` 接收这份数据，并
-生成三类缓存：
+这里不是先根据 Topic 查询 `brokerName`，再拿 `brokerName` 向 NameServer 发起第二次
+地址查询。Topic 路由响应已经同时包含 `QueueData` 和 `BrokerData`，客户端只需要在
+本地把两者关联起来。
 
-1. **Broker 地址缓存**：得到
-   `brokerAddrTable["broker-a"][0] = "10.255.255.254:10911"`，供发送、拉取、
-   心跳和管理请求查找网络地址。
+#### 第一步：Broker 注册路由
+
+Broker 向 NameServer 注册时会上报 `brokerName`、`brokerId`、`brokerAddr` 和 Topic
+配置。NameServer 主要维护两类索引：
+
+```text
+topicQueueTable:
+  topic -> brokerName -> QueueData
+
+brokerAddrTable:
+  brokerName -> brokerId -> brokerAddr
+```
+
+例如一个主从组会登记为：
+
+```text
+broker-a -> {
+  0 -> 10.0.0.1:10911,  // Master
+  1 -> 10.0.0.2:10911   // Slave
+}
+```
+
+注册代码位于
+[RouteInfoManager.java](../namesrv/src/main/java/org/apache/rocketmq/namesrv/routeinfo/RouteInfoManager.java)。
+
+#### 第二步：客户端按 Topic 查询完整路由
+
+首次使用某个 Topic 或刷新路由时，客户端向 NameServer 发送
+`GET_ROUTEINFO_BY_TOPIC`。NameServer 先从 `topicQueueTable` 找出承载该 Topic 的
+`brokerName`，再从 `brokerAddrTable` 复制相应地址，组装成一个 `TopicRouteData`
+返回。例如：
+
+```text
+queueDatas:
+  broker-a -> writeQueueNums=4
+  broker-b -> writeQueueNums=4
+
+brokerDatas:
+  broker-a -> {0=10.0.0.1:10911, 1=10.0.0.2:10911}
+  broker-b -> {0=10.0.0.3:10911}
+```
+
+查询入口位于
+[MQClientAPIImpl.java](../client/src/main/java/org/apache/rocketmq/client/impl/MQClientAPIImpl.java)，
+NameServer 的响应组装位于
+[RouteInfoManager.java](../namesrv/src/main/java/org/apache/rocketmq/namesrv/routeinfo/RouteInfoManager.java)。
+
+#### 第三步：客户端拆成几个本地缓存
+
+`MQClientInstance.updateTopicRouteInfoFromNameServer` 收到路由后，主要更新：
+
+1. **Broker 地址缓存**：
+   `brokerAddrTable[brokerName][brokerId] = brokerAddr`。
 2. **Producer 发布路由**：`topicRouteData2TopicPublishInfo` 检查写权限和 Master，
-   使用 `writeQueueNums=4` 生成 Queue ID 0 到 3，写入
-   `topicPublishInfoTable`。Producer 的负载均衡或自定义 Selector 从中选一个队列。
-3. **Consumer 订阅路由**：`topicRouteData2TopicSubscribeInfo` 检查读权限，使用
-   `readQueueNums=4` 生成 Queue ID 0 到 3。Rebalance 再把这些队列分配给消费组内的
-   Consumer 实例。
+   按 `writeQueueNums` 展开为 `MessageQueue(topic, brokerName, queueId)`，写入
+   `topicPublishInfoTable`。
+3. **Consumer 订阅路由**：`topicRouteData2TopicSubscribeInfo` 检查读权限，按
+   `readQueueNums` 生成订阅队列，供 Rebalance 分配。
 
-转换代码位于：
+以上示例会为 Producer 生成：
+
+```text
+MessageQueue(topic, broker-a, 0..3)
+MessageQueue(topic, broker-b, 0..3)
+```
+
+转换和缓存更新代码位于
 [MQClientInstance.java](../client/src/main/java/org/apache/rocketmq/client/impl/factory/MQClientInstance.java)。
 
-因此，在当前只有一个 Broker 的示例中，Producer 的负载均衡是在 `broker-a` 的 4
-个 Queue 之间选择；如果以后增加其他 Broker，这份路由会包含更多 `QueueData` 和
-`BrokerData`，客户端刷新缓存后就能在更多 Broker 和 Queue 之间分配流量。
+#### 第四步：Producer 本地解析 Master 地址
+
+Producer 先从发布路由中选出一个 `MessageQueue`，例如：
+
+```text
+MessageQueue(OrderTopic, broker-a, queueId=2)
+```
+
+随后 `sendKernelImpl` 取出 `brokerName=broker-a`，调用
+`findBrokerAddressInPublish(brokerName)` 查询客户端本地 `brokerAddrTable`。发送路径
+固定取 `brokerId=0`，因此得到 Master 地址：
+
+```text
+brokerAddrTable["broker-a"][0] -> 10.0.0.1:10911
+```
+
+客户端再向该地址发送请求，并把 `queueId=2` 写入请求头。普通 Topic 直接使用
+`MessageQueue` 中的 `brokerName`；静态 Topic 会先把逻辑队列映射到当前实际承载它的
+物理 Broker。
+
+发送寻址代码位于
+[DefaultMQProducerImpl.java](../client/src/main/java/org/apache/rocketmq/client/impl/producer/DefaultMQProducerImpl.java)
+和
+[MQClientInstance.java](../client/src/main/java/org/apache/rocketmq/client/impl/factory/MQClientInstance.java)。
+
+#### Consumer 的区别
+
+Consumer 同样从 `MessageQueue` 取得 `brokerName`，但会调用
+`findBrokerAddressInSubscribe(brokerName, brokerId, ...)`。Producer 写入固定找 Master，
+Consumer 拉取则可以根据 Broker 的建议和配置选择 Master 或 Slave；目标地址不在缓存
+时，拉取路径会先刷新该 Topic 的路由再重试。
+
+消费寻址代码位于
+[PullAPIWrapper.java](../client/src/main/java/org/apache/rocketmq/client/impl/consumer/PullAPIWrapper.java)。
+
+客户端默认每 30 秒刷新一次已经使用的 Topic 路由；首次发送发现发布路由不存在时也会
+立即查询 NameServer。因此正常发送过程中使用的是本地路由快照，并不会每发送一条消息
+都访问 NameServer。
+
+整个寻址过程可以概括为：
+
+```text
+Broker 注册 brokerName / brokerId / brokerAddr
+  -> 客户端按 Topic 查询一次 TopicRouteData
+  -> 缓存 MessageQueue 列表和 brokerAddrTable
+  -> 选择 MessageQueue
+  -> 取得 brokerName
+  -> 本地查询 brokerId 对应的地址
+  -> 连接 Broker 发送或拉取
+```
 
 ## 4. 返回后怎么使用
 
