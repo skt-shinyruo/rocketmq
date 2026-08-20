@@ -6,6 +6,136 @@ Broker 路由注册的本质是：Broker 主动把自己所属的集群、主从
 
 本文基于当前仓库 `learning` 分支源码整理。
 
+## 零、Topic 与 Broker 的关系和创建位置
+
+### 1. Topic、Broker 和 MessageQueue
+
+Topic 是消息的逻辑分类，Broker 是存储和传输消息的服务节点。二者是多对多关系：一个
+Topic 可以分布在多个 Broker 上，一个 Broker 也可以承载多个 Topic。
+
+Topic 在每个 Broker 上会被划分为若干 `MessageQueue`。一个队列由下面三个字段唯一确定：
+
+```text
+(topic, brokerName, queueId)
+```
+
+例如，`OrderTopic` 分布在两个 Broker 复制组上，每组配置两个队列：
+
+```text
+OrderTopic
+├── broker-a
+│   ├── Queue 0
+│   └── Queue 1
+└── broker-b
+    ├── Queue 0
+    └── Queue 1
+```
+
+Broker 把这些 Topic 和队列配置注册到 NameServer。Producer 查询路由后选择其中一个
+`MessageQueue`，再向对应 Broker 发送消息；Consumer 查询相同路由后消费 Topic 的所有
+队列，集群消费模式下再把这些队列分配给不同 Consumer。
+
+Broker 内部并不是为每个 Topic 单独保存一份消息文件。所有 Topic 的消息主体统一顺序写入
+`CommitLog`，再通过按 `Topic + queueId` 组织的 `ConsumeQueue` 建立消费索引。详细存储
+结构见 [RocketMQ 消息存储模型详解](rocketmq_storage_model.md)。
+
+因此可以把三者的关系概括为：**Topic 决定消息属于哪一类，Broker 决定消息存在哪里，
+MessageQueue 是 Topic 在 Broker 上的实际分片。**
+
+### 2. Broker 如何知道自己承载哪些 Topic
+
+Broker 不会扫描消息文件推断 Topic，也不是由 NameServer 向它下发 Topic 配置。Broker
+自己维护 `TopicConfigManager.topicConfigTable`，其中每个 `TopicConfig` 保存 Topic 名称、
+读写队列数、权限和系统标记等信息：
+
+```text
+管理命令 / 自动创建 / 启动加载 / 主从同步
+                    ↓
+Broker.topicConfigTable
+  TopicA -> readQueueNums=4, writeQueueNums=4
+                    ↓
+持久化 topics.json
+                    ↓
+增量或周期注册到 NameServer
+```
+
+这张配置表主要有以下来源：
+
+1. **管理命令创建或修改**：`mqadmin updateTopic` 将完整的 `TopicConfig` 直接发送给目标
+   Broker。Broker 更新内存表、持久化配置，并立即向 NameServer 增量注册。
+2. **Broker 启动加载**：Broker 从
+   `${storePathRootDir}/config/topics.json` 恢复已有 Topic 配置。
+3. **自动创建**：开启 `autoCreateTopicEnable=true` 后，Broker 收到发往不存在 Topic 的
+   消息时，可以根据默认 Topic `TBW102` 创建配置。队列数取 Producer 默认值和
+   `TBW102` 队列数中的较小值。
+4. **系统 Topic 初始化**：Broker 启动时直接初始化自测、延迟消息和集群等系统 Topic。
+5. **Slave 同步**：经典 Master-Slave 模式下，Slave 会从 Master 获取 Topic 配置，并在
+   `DataVersion` 变化时替换自己的本地配置表。
+
+相关实现位于
+[TopicConfigManager.java](../broker/src/main/java/org/apache/rocketmq/broker/topic/TopicConfigManager.java)、
+[AdminBrokerProcessor.java](../broker/src/main/java/org/apache/rocketmq/broker/processor/AdminBrokerProcessor.java)
+和 [SlaveSynchronize.java](../broker/src/main/java/org/apache/rocketmq/broker/slave/SlaveSynchronize.java)。
+
+Broker 注册时遍历自己的 `topicConfigTable`，将 Topic 名称、读写队列数和权限打包上报。
+所以顺序是：**Broker 先有本地 Topic 配置，NameServer 再根据 Broker 的上报生成路由。**
+
+### 3. 使用 Topic 前是否必须创建
+
+严格来说不一定：开启 `autoCreateTopicEnable=true` 时，第一次发送消息可以触发 Broker
+自动创建 Topic。关闭自动创建时，Topic 不存在会导致发送失败，Producer 最终得到
+`No route info of this topic` 或 Broker 返回 `TOPIC_NOT_EXIST`。
+
+生产环境通常应提前显式创建 Topic，确保队列数量、权限和 Broker 分布是确定的，而不是
+由第一次发送消息的选路结果决定。
+
+### 4. Topic 最终位于哪些 Broker
+
+Topic 不会“运行”在某个 Broker 中；它的配置和消息由创建时选定的 Broker 承载。执行
+管理命令的机器与 Topic 位于哪里无关，`-b` 或 `-c` 参数才决定目标。
+
+按集群创建：
+
+```bash
+sh mqadmin updateTopic \
+  -n nameserver:9876 \
+  -c DefaultCluster \
+  -t OrderTopic \
+  -r 4 \
+  -w 4
+```
+
+`-c DefaultCluster` 会从 NameServer 找到该集群的所有 Master 地址，并分别创建 Topic。
+假设集群有 `broker-a`、`broker-b` 两个复制组，那么结果是：
+
+```text
+OrderTopic
+├── broker-a：Queue 0～3
+└── broker-b：Queue 0～3
+```
+
+该 Topic 一共有 8 个可写逻辑队列，Producer 根据 NameServer 返回的路由把消息发送到
+`broker-a` 或 `broker-b`。
+
+按单个 Broker 创建：
+
+```bash
+sh mqadmin updateTopic \
+  -n nameserver:9876 \
+  -b 192.168.1.10:10911 \
+  -t OrderTopic \
+  -r 4 \
+  -w 4
+```
+
+此时 Topic 只由指定 Broker 复制组承载，Producer 的路由中也只有该组的队列。管理命令的
+具体选点逻辑见
+[UpdateTopicSubCommand.java](../tools/src/main/java/org/apache/rocketmq/tools/command/topic/UpdateTopicSubCommand.java)。
+
+Master-Slave 模式下，管理命令向 Master 创建 Topic，Topic 配置和消息随后同步到 Slave。
+Master 和 Slave 属于同一个 `brokerName` 复制组，Slave 是副本，不会让 Topic 的逻辑队列
+数量翻倍。Producer 应用运行在哪台机器，与 Topic 最终由哪些 Broker 承载也没有关系。
+
 ## 一、整体调用链
 
 ```mermaid
@@ -118,19 +248,43 @@ Topic。
 | `haServerAddr` | 主从复制使用的 HA 地址 |
 | `heartbeatTimeoutMillis` | NameServer 判断 Broker 失活的超时时间 |
 | `enableActingMaster` | 是否允许 Slave Acting Master |
+| `compressed` | Body 是否使用压缩格式 |
 | `bodyCrc32` | 注册 Body 的 CRC32 校验值 |
 
 定义见
 [RegisterBrokerRequestHeader.java](../remoting/src/main/java/org/apache/rocketmq/remoting/protocol/header/namesrv/RegisterBrokerRequestHeader.java)。
 
+RocketMQ 使用自己的 Remoting 协议，并不是 HTTP 请求。请求头字段会作为字符串写入
+`RemotingCommand.extFields`。例如，一个 Master 的普通注册请求可以理解为：
+
+```text
+code = 103  // REGISTER_BROKER
+extFields = {
+  clusterName: "DefaultCluster",
+  brokerName: "broker-a",
+  brokerId: "0",
+  brokerAddr: "10.0.0.1:10911",
+  haServerAddr: "10.0.0.1:10912",
+  enableActingMaster: "false",
+  compressed: "false",
+  bodyCrc32: "1657123456"
+}
+```
+
+其中 `bodyCrc32` 会根据本次 Body 的实际字节变化。普通模式不发送可选的
+`heartbeatTimeoutMillis`；例如开启 Slave Acting Master 后，请求头还会包含
+`heartbeatTimeoutMillis: "10000"`，同时 `enableActingMaster` 为 `"true"`。
+
 ### 2. 请求体
 
 ```text
 RegisterBrokerBody
-├── TopicConfigSerializeWrapper
-│   ├── DataVersion
+├── TopicConfigAndMappingSerializeWrapper
+│   ├── dataVersion
 │   ├── topicConfigTable
-│   └── topicQueueMappingInfoMap
+│   ├── topicQueueMappingInfoMap
+│   ├── topicQueueMappingDetailMap
+│   └── mappingDataVersion
 └── filterServerList
 ```
 
@@ -139,6 +293,68 @@ RegisterBrokerBody
 
 请求体定义见
 [RegisterBrokerBody.java](../remoting/src/main/java/org/apache/rocketmq/remoting/protocol/body/RegisterBrokerBody.java)。
+
+例如，`broker-a` 上报一个具有 4 个读写队列的普通 `TopicA` 时，未压缩 Body 展开后大致
+如下。JSON 字段顺序不影响含义：
+
+```json
+{
+  "topicConfigSerializeWrapper": {
+    "dataVersion": {
+      "stateVersion": 0,
+      "timestamp": 1787184000000,
+      "counter": 12
+    },
+    "topicConfigTable": {
+      "TopicA": {
+        "topicName": "TopicA",
+        "readQueueNums": 4,
+        "writeQueueNums": 4,
+        "perm": 6,
+        "topicFilterType": "SINGLE_TAG",
+        "topicSysFlag": 0,
+        "order": false,
+        "attributes": {}
+      }
+    },
+    "topicQueueMappingInfoMap": {},
+    "topicQueueMappingDetailMap": {},
+    "mappingDataVersion": {
+      "stateVersion": 0,
+      "timestamp": 1787184000000,
+      "counter": 0
+    }
+  },
+  "filterServerList": []
+}
+```
+
+这里 `perm=6` 表示同时可读、可写；`DataVersion` 用于判断 Topic 配置是否变化。普通 Topic
+没有静态 Topic 映射，因此示例中的映射表为空；当前常规注册也不使用 FilterServer，所以
+`filterServerList` 通常为空数组。
+
+注意：上面的 JSON 只表示请求体，不是完整的 `REGISTER_BROKER` 请求。Broker 自身信息在
+同一个 `RemotingCommand` 的请求头 `extFields` 中：
+
+```text
+完整 REGISTER_BROKER 请求
+├── code = 103
+├── header.extFields
+│   ├── clusterName   = "DefaultCluster"
+│   ├── brokerName    = "broker-a"
+│   ├── brokerId      = "0"
+│   ├── brokerAddr    = "10.0.0.1:10911"  // Broker 客户端地址
+│   ├── haServerAddr  = "10.0.0.1:10912"  // HA 复制地址
+│   ├── enableActingMaster
+│   ├── heartbeatTimeoutMillis
+│   ├── compressed
+│   └── bodyCrc32
+└── body = 上面的 topicConfigSerializeWrapper + filterServerList
+```
+
+因此，`brokerAddr` 和 `haServerAddr` 不会出现在 `topicConfigTable` 中：NameServer 使用
+请求头的 `brokerAddr` 作为 `brokerLiveTable` 的实例键，并将 `brokerId -> brokerAddr` 写入
+`brokerAddrTable`；请求体里的 Topic 配置则转换成 `topicQueueTable` 中的 `QueueData`。
 
 Broker 会先序列化一次请求体并计算 CRC32，然后并发向所有可用 NameServer 发送同一份
 `REGISTER_BROKER` 请求。各 NameServer 节点独立处理，彼此之间不复制路由数据。
@@ -198,6 +414,93 @@ NameServer 在收到注册请求后执行：
 | `brokerLiveTable` | `(clusterName, brokerAddr) -> BrokerLiveInfo` | 活跃时间、超时、Channel、版本和 HA 地址 |
 | `filterServerTable` | `(clusterName, brokerAddr) -> filterServerList` | FilterServer 地址 |
 | `topicQueueMappingInfoTable` | `topic -> brokerName -> mappingInfo` | 静态 Topic 逻辑队列映射 |
+
+沿用前文示例，假设 `broker-a` 的 Master 和 Slave 都已注册，Master 上报了普通
+`TopicA`。此时六张表的内存数据大致如下，时间戳和 Netty Channel 仅作示意：
+
+```text
+clusterAddrTable = {
+  "DefaultCluster": {"broker-a"}
+}
+
+brokerAddrTable = {
+  "broker-a": BrokerData(
+    cluster="DefaultCluster",
+    brokerName="broker-a",
+    brokerAddrs={
+      0L: "10.0.0.1:10911",  // Master
+      1L: "10.0.0.2:10911"   // Slave
+    },
+    zoneName=null,
+    enableActingMaster=false
+  )
+}
+
+topicQueueTable = {
+  "TopicA": {
+    "broker-a": QueueData(
+      brokerName="broker-a",
+      readQueueNums=4,
+      writeQueueNums=4,
+      perm=6,              // RW
+      topicSysFlag=0
+    )
+  }
+}
+
+brokerLiveTable = {
+  BrokerAddrInfo("DefaultCluster", "10.0.0.1:10911"):
+    BrokerLiveInfo(
+      lastUpdateTimestamp=1787184000123,
+      heartbeatTimeoutMillis=120000,
+      dataVersion=(stateVersion=0, timestamp=1787184000000, counter=12),
+      channel=<Master 的 Netty Channel>,
+      haServerAddr="10.0.0.1:10912"
+    ),
+  BrokerAddrInfo("DefaultCluster", "10.0.0.2:10911"):
+    BrokerLiveInfo(
+      lastUpdateTimestamp=1787184000456,
+      heartbeatTimeoutMillis=120000,
+      dataVersion=(stateVersion=0, timestamp=1787184000000, counter=12),
+      channel=<Slave 的 Netty Channel>,
+      haServerAddr="10.0.0.2:10912"
+    )
+}
+
+filterServerTable = {}
+
+topicQueueMappingInfoTable = {}
+```
+
+可以看到，`brokerAddrTable` 按复制组保存一份 `BrokerData`，其中包含两个物理实例；
+`brokerLiveTable` 则按物理地址分别保存两份存活信息。`topicQueueTable` 按 `brokerName`
+只有一份 `QueueData`，不会因为存在 Master 和 Slave 而变成两份。普通注册上报空
+`filterServerList` 时，NameServer 会删除对应项，所以示例中 `filterServerTable` 是空表。
+
+如果使用 FilterServer 或静态 Topic，对应的两张表可能是：
+
+```text
+filterServerTable = {
+  BrokerAddrInfo("DefaultCluster", "10.0.0.1:10911"):
+    ["10.0.0.1:12000"]
+}
+
+topicQueueMappingInfoTable = {
+  "TopicA": {
+    "broker-a": TopicQueueMappingInfo(
+      topic="TopicA",
+      scope="__global__",
+      totalQueues=4,
+      bname="broker-a",
+      epoch=3,
+      dirty=false,
+      currIdMap={0: 0, 1: 1, 2: 2, 3: 3}
+    )
+  }
+}
+```
+
+`currIdMap` 表示 `逻辑队列 ID -> 当前 Broker 上的物理队列 ID`。
 
 这些字段和核心注册实现位于
 [RouteInfoManager.java](../namesrv/src/main/java/org/apache/rocketmq/namesrv/routeinfo/RouteInfoManager.java)。
