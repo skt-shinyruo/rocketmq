@@ -1243,95 +1243,134 @@ public void recover(final boolean lastExitOK) {
 
 ## 十、消息压缩机制
 
-### 10.1 压缩算法对比
+这里讨论的是 Java Client 普通消息的 **body 压缩**。RocksDB 文件压缩和 Broker 注册信息
+压缩是另外两套逻辑，不属于这条消息发送与消费主链路。
 
-RocketMQ 支持三种压缩算法，各有不同的性能特征：
+### 10.1 端到端流程
 
-| 压缩算法 | 压缩率 | 压缩速度 | 解压速度 | 适用场景 |
-|---------|--------|---------|---------|---------|
-| **LZ4** | 中等 (~2.1x) | 最快 (~740 MB/s) | 最快 (~4500 MB/s) | 低延迟、高吞吐场景 |
-| **ZSTD** | 高 (~2.9x) | 快 (~530 MB/s) | 快 (~1700 MB/s) | 平衡压缩率与性能 |
-| **ZLIB** | 高 (~2.7x) | 慢 (~95 MB/s) | 中等 (~400 MB/s) | 追求极致压缩率 |
+```text
+原始消息 body
+  -> Producer 校验原始消息大小
+  -> 达到阈值后压缩 body
+  -> sysFlag 标记“已压缩 + 压缩算法”
+  -> Broker 不解压，原样写入 CommitLog
+  -> Broker Pull 时原样返回 CommitLog 数据
+  -> Consumer 根据 sysFlag 自动解压
+  -> 业务代码取得原始 body
+```
 
-### 10.2 压缩类型定义
+压缩后的数据覆盖了 Producer 到 Broker、Broker 到 Consumer 的网络传输，也以压缩形态
+保存在 CommitLog 中并参与 HA 复制。Topic、properties 和 Remoting 请求头不属于消息 body，
+不会被这套逻辑一起压缩。
 
-压缩类型通过 `CompressionType` 枚举定义，存储在消息的 `SysFlag` 中：
+### 10.2 Producer 判断与压缩
+
+普通发送先由 `Validators.checkMessage` 校验原始 body，再进入
+[`DefaultMQProducerImpl.tryToCompressMessage`](../client/src/main/java/org/apache/rocketmq/client/impl/producer/DefaultMQProducerImpl.java)：
 
 ```java
-public enum CompressionType {
-    LZ4(1),
-    ZSTD(2),
-    ZLIB(3);
-}
-```
-
-**SysFlag 压缩标志位**（[MessageSysFlag.java](file:///home/feng/code/opensource/rocketmq/common/src/main/java/org/apache/rocketmq/common/sysflag/MessageSysFlag.java)）：
-
-```java
-public final static int COMPRESSION_LZ4_TYPE = 0x1 << 8;
-public final static int COMPRESSION_ZSTD_TYPE = 0x2 << 8;
-public final static int COMPRESSION_ZLIB_TYPE = 0x3 << 8;
-public final static int COMPRESSION_TYPE_COMPARATOR = 0x7 << 8;
-```
-
-### 10.3 压缩流程
-
-**消息写入时压缩**：
-
-```
-Producer 设置压缩类型
-    │
-    ↓
-消息发送时判断是否需要压缩
-    │
-    ├── bodySize >= compressMsgBodyOverHowmuch (默认 4KB) ──→ 压缩
-    │                                                          │
-    │                                                          ↓
-    │                                            CompressorFactory.getCompressor(type)
-    │                                                          │
-    │                                                          ↓
-    │                                            压缩消息体，设置 SysFlag 压缩标志
-    │                                                          │
-    │                                                          ↓
-    └── bodySize < compressMsgBodyOverHowmuch ──→ 不压缩 ──→ 写入 CommitLog
-```
-
-**消息读取时解压**：
-
-```
-Consumer 读取消息
-    │
-    ↓
-检查 SysFlag 是否有压缩标志
-    │
-    ├── 有压缩标志 ──→ 获取压缩类型 ──→ 解压消息体 ──→ 返回给 Consumer
-    │
-    └── 无压缩标志 ──→ 直接返回消息体
-```
-
-**核心代码**（[MessageDecoder.java](file:///home/feng/code/opensource/rocketmq/common/src/main/java/org/apache/rocketmq/common/message/MessageDecoder.java)）：
-
-```java
-public static byte[] encode(MessageExt messageExt, boolean needCompress) throws Exception {
-    byte[] body = messageExt.getBody();
-    byte[] newBody = body;
-    if (needCompress && (sysFlag & MessageSysFlag.COMPRESSED_FLAG) == MessageSysFlag.COMPRESSED_FLAG) {
-        Compressor compressor = CompressorFactory.getCompressor(MessageSysFlag.getCompressionType(sysFlag));
-        newBody = compressor.compress(body, 5);
+if (!(msg instanceof MessageBatch)
+    && body.length >= defaultMQProducer.getCompressMsgBodyOverHowmuch()) {
+    byte[] data = defaultMQProducer.getCompressor()
+        .compress(body, defaultMQProducer.getCompressLevel());
+    if (data != null) {
+        msg.setBody(data);
+        return true;
     }
-    // ... 编码逻辑
 }
 ```
 
-### 10.4 配置参数
+压缩成功后，`sendKernelImpl` 设置压缩标志和算法标志：
 
-> **注意**：以下压缩配置参数位于 Producer 客户端（[DefaultMQProducer.java](file:///home/feng/code/opensource/rocketmq/client/src/main/java/org/apache/rocketmq/client/producer/DefaultMQProducer.java)），而非 Broker 端。
+```java
+sysFlag |= MessageSysFlag.COMPRESSED_FLAG;
+sysFlag |= defaultMQProducer.getCompressType().getCompressionFlag();
+```
+
+随后 [`MQClientAPIImpl`](../client/src/main/java/org/apache/rocketmq/client/impl/MQClientAPIImpl.java)
+把当前 `msg.getBody()` 直接设置成 RemotingCommand 的 body。发送结束后，kernel 的
+`finally` 会把调用方 `Message` 恢复成原始 body；异步发送会按需 clone 消息，保证网络层
+仍持有压缩后的字节。
+
+如果压缩抛出 `IOException`，客户端记录日志并继续发送原始 body，不设置压缩标志。
+当前实现也不会比较压缩前后的大小：只要 compressor 返回非 `null`，即使结果更大也会使用。
+
+### 10.3 算法与 `sysFlag`
+
+[`CompressionType`](../common/src/main/java/org/apache/rocketmq/common/compression/CompressionType.java)
+支持三种算法：
+
+| 算法 | 编号 | 实现特点 |
+| --- | ---: | --- |
+| LZ4 | 1 | 使用 LZ4 Frame，当前实现忽略 `compressLevel` |
+| ZSTD | 2 | 使用 ZSTD Stream，使用配置的 `compressLevel` |
+| ZLIB | 3 | 使用 JDK `Deflater`，默认算法 |
+
+[`MessageSysFlag`](../common/src/main/java/org/apache/rocketmq/common/sysflag/MessageSysFlag.java)
+用 bit 0 表示 body 已压缩，用第 8～10 位记录算法：
+
+```java
+COMPRESSED_FLAG       = 0x1;
+COMPRESSION_LZ4_TYPE  = 0x1 << 8;
+COMPRESSION_ZSTD_TYPE = 0x2 << 8;
+COMPRESSION_ZLIB_TYPE = 0x3 << 8;
+```
+
+旧消息可能只有 `COMPRESSED_FLAG`、没有算法位。算法编号为 0 时按 ZLIB 处理，以兼容旧版本。
+
+### 10.4 Broker 原样存储和传输
+
+[`SendMessageProcessor`](../broker/src/main/java/org/apache/rocketmq/broker/processor/SendMessageProcessor.java)
+从请求中取出 body 和 `sysFlag`，直接构造 `MessageExtBrokerInner`，不会在写入前解压。
+
+`CommitLog.asyncPutMessage` 针对收到的压缩 body 计算 `BODYCRC`，随后
+[`MessageExtEncoder`](../store/src/main/java/org/apache/rocketmq/store/MessageExtEncoder.java)
+把 body、长度和 `sysFlag` 一起编码进 CommitLog。Pull 消息时 Broker 同样不解压，通常
+直接把对应的 CommitLog Buffer 发送给客户端。
+
+因此 Tag 和属性过滤不需要解压 body：这些元数据本来就独立保存在 CommitLog 记录中。
+
+### 10.5 Consumer 自动解压
+
+Java Consumer 在 [`PullAPIWrapper`](../client/src/main/java/org/apache/rocketmq/client/impl/consumer/PullAPIWrapper.java)
+中调用 [`MessageDecoder`](../common/src/main/java/org/apache/rocketmq/common/message/MessageDecoder.java)
+批量解码。默认 `decodeDecompressBody=true`，解码器执行：
+
+```java
+if (deCompressBody && (sysFlag & MessageSysFlag.COMPRESSED_FLAG) != 0) {
+    Compressor compressor = CompressorFactory.getCompressor(
+        MessageSysFlag.getCompressionType(sysFlag));
+    body = compressor.decompress(body);
+    sysFlag &= ~MessageSysFlag.COMPRESSED_FLAG;
+}
+```
+
+所以业务消费回调默认看到的是原始 body。关闭自动解压后，客户端会保留压缩 body 和
+`COMPRESSED_FLAG`，调用方需要自行按照算法位处理。
+
+### 10.6 配置与边界
+
+Producer 配置位于
+[`DefaultMQProducer`](../client/src/main/java/org/apache/rocketmq/client/producer/DefaultMQProducer.java)：
 
 | 参数 | 默认值 | 说明 |
-|-----|-------|------|
-| `compressMsgBodyOverHowmuch` | 4096 bytes | 消息体超过此大小才进行压缩 |
-| `compressType` | ZLIB | 默认压缩算法（支持 LZ4/ZSTD/ZLIB） |
-| `compressLevel` | 5 | 压缩级别（1-9，数值越大压缩率越高但速度越慢） |
+| --- | --- | --- |
+| `compressMsgBodyOverHowmuch` | `4096` bytes | 原始 body 大小大于等于该值时尝试压缩 |
+| `compressType` | `ZLIB` | 支持 LZ4、ZSTD、ZLIB |
+| `compressLevel` | `5` | 传给所选 compressor；LZ4 当前不使用该参数 |
+| `decodeDecompressBody` | `true` | Consumer 是否在解码时自动解压 |
+
+`compressType` 和 `compressLevel` 也可分别通过 JVM 属性
+`rocketmq.message.compressType`、`rocketmq.message.compressLevel` 设置；Consumer 自动解压
+可通过 `com.rocketmq.decompress.body` 设置。
+
+还要注意以下边界：
+
+- `MessageBatch` 当前不走这套压缩逻辑，包括显式 Batch 和最终形成 `MessageBatch` 的
+  autoBatch 请求。
+- Producer 的默认 `4 MiB` 大小限制在压缩前检查，因此不能依靠压缩绕过原始消息限制。
+- Broker 存储侧检查的是实际收到的 body 和整条 CommitLog 记录大小；对标准 Java Client
+  来说，此时 body 已经是压缩后的字节。
 
 ---
 

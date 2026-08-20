@@ -181,6 +181,56 @@ Retry Topic 和 Producer Group 等排除检查，当这些检查使消息改为�
 自动批量源码：
 [`ProduceAccumulator.java`](../client/src/main/java/org/apache/rocketmq/client/producer/ProduceAccumulator.java)。
 
+### 3.3 RocketMQ 与 Kafka 的批量发送对比
+
+RocketMQ 有批量发送，但经典 Java 客户端长期以调用方显式组批为主，因此默认使用时看起来
+更像逐条发送；当前 `5.5.0` 源码还提供了可选的自动攒批。
+
+显式批量直接把一个消息集合编码成一次 `MessageBatch` 请求：
+
+```java
+List<Message> messages = new ArrayList<>();
+messages.add(message1);
+messages.add(message2);
+messages.add(message3);
+SendResult result = producer.send(messages);
+```
+
+同一批消息必须具有相同的 Topic 和 `waitStoreMsgOK`，不支持延时消息和 Retry Topic
+消息；编码后的整个批次还受 Producer `maxMessageSize` 限制，默认是 `4 MiB`。入口是
+[`MQProducer.send(Collection<Message>)`](../client/src/main/java/org/apache/rocketmq/client/producer/MQProducer.java)，
+约束由
+[`MessageBatch.generateFromList`](../common/src/main/java/org/apache/rocketmq/common/message/MessageBatch.java)
+检查。
+
+需要类似 Kafka Producer 的透明攒批时，可以在 `start()` 前开启 autoBatch：
+
+```java
+producer.setAutoBatch(true);
+producer.batchMaxDelayMs(10);
+producer.batchMaxBytes(32 * 1024);
+producer.start();
+
+producer.send(message, callback);
+```
+
+异步发送更接近 Kafka 的使用方式：调用线程把消息加入 accumulator 后立即返回，等待达到
+时间或大小阈值后统一发送。同步发送也能进入 accumulator，但当前调用会等待所属批次发出，
+单线程逐条同步调用通常无法互相凑批。
+
+| 对比项 | Kafka Producer | RocketMQ 经典 Java Producer |
+| --- | --- | --- |
+| 默认模型 | 单条 `send` 透明进入按 partition 组织的 accumulator | `autoBatch` 默认关闭，传统方式由调用方显式传 `Collection<Message>` |
+| 时间阈值 | `linger.ms` | `batchMaxDelayMs`，启用后默认 `10 ms` |
+| 单批大小 | `batch.size` | `batchMaxBytes`，启用后默认 `32 KiB` |
+| 总缓存 | `buffer.memory` | `totalBatchMaxBytes`，启用后默认 `32 MiB` |
+| 聚合维度 | Topic partition | Topic、指定 Queue、`waitStoreMsgOK`、Tag |
+
+这些参数只是用途近似，不是完全相同的协议语义。RocketMQ 的 autoBatch 仍会生成
+`MessageBatch` 并接回普通发送主线；显式传 `timeout` 的重载和 `sendOneway` 会绕过它，
+延时消息、Retry Topic 消息等也会退回单条直发。旧版客户端如果没有 `setAutoBatch`，仍可
+使用 `send(Collection<Message>)` 显式批量发送。
+
 ## 4. 默认同步主线：`sendDefaultImpl`
 
 下面先只看最常见的默认同步发送。它包含路由、默认队列选择和外层重试，是理解其他
@@ -343,6 +393,45 @@ kernel 在网络请求前依次处理：
 授权 Pipeline、Broker SendMessageHook、Store PutMessageHook 是不同层次，不能混为
 同一个 Hook。
 
+### 5.3 两个 Producer 客户端 Hook 的区别
+
+`sendKernelImpl` 在构造请求头并向 Broker 发送前，会依次处理两类 Hook：
+
+```text
+CheckForbiddenHook（发送许可校验）
+  -> SendMessageHook.sendMessageBefore（发送前追踪）
+  -> 向 Broker 发送
+  -> SendMessageHook.sendMessageAfter（记录结果或异常）
+```
+
+#### `CheckForbiddenHook`
+
+它先将 NameServer 地址、Producer Group、通信模式、Broker 地址、消息、
+目标队列和 Unit 模式封装到 `CheckForbiddenContext`，再依次调用已注册的
+`CheckForbiddenHook.checkForbidden`。
+
+这是一个强制校验扩展点，可用于权限、黑白名单或其他发送限制。Hook 抛出
+`MQClientException` 时，异常会继续向上抛出，本次消息不会发送。这段代码
+自身不包含具体禁止规则，只负责执行已注册的 Hook。
+
+#### `SendMessageHook`
+
+它将 Producer、Producer Group、通信模式、客户端地址、Broker 地址、消息、
+目标队列和 namespace 封装到 `SendMessageContext`。上下文默认把消息标记为
+普通消息，并根据消息属性进一步识别：
+
+- `PROPERTY_TRANSACTION_PREPARED=true`：事务半消息。
+- 存在延时级别或定时投递属性：延时消息。
+- 其他情况：普通消息。
+
+然后执行 `sendMessageBefore`；发送完成后，发送结果或异常会放入同一个
+上下文，再执行 `sendMessageAfter`。RocketMQ 内置的消息轨迹和 OpenTracing 实现就使用
+了这个扩展点。`SendMessageHook` 抛出的异常会被 Producer 捕获并记录告警日志，
+不会阻止正常发送。
+
+因此，两者的核心区别是：`CheckForbiddenHook` 可以拒绝发送；`SendMessageHook`
+主要观察和记录发送过程，其自身失败不影响消息发送。
+
 ## 6. 从请求对象到网络字节
 
 ### 6.1 Request Code 与请求头版本
@@ -395,6 +484,75 @@ Broker 响应会复制同一个 `opaque`。客户端 Netty 线程收到响应后
 时会分配新的 `opaque`，避免旧响应误配到新尝试。
 
 ### 6.4 三种通信模式的真实边界
+
+`CommunicationMode` 表示客户端与 Broker 之间处理一次请求的方式：
+
+| 模式 | 调用线程是否等待 Broker 响应 | 获取结果的方式 | 典型用途 |
+| --- | --- | --- | --- |
+| `SYNC` | 是 | 方法直接返回 `SendResult` | 需要立即确认发送结果的业务消息 |
+| `ASYNC` | 否 | `SendCallback` 回调 | 高并发、希望减少业务线程等待的发送场景 |
+| `ONEWAY` | 否，Broker 也不返回响应 | 没有发送结果 | 日志、监控等允许少量消息丢失的场景 |
+
+对应的 Producer API 用法：
+
+```java
+// SYNC：当前线程等待发送结果
+SendResult result = producer.send(message);
+
+// ASYNC：发送结果通过回调返回
+producer.send(message, new SendCallback() {
+    @Override
+    public void onSuccess(SendResult result) {
+    }
+
+    @Override
+    public void onException(Throwable e) {
+    }
+});
+
+// ONEWAY：不等待 Broker 响应，也没有回调
+producer.sendOneway(message);
+```
+
+异步并不等于不可靠，调用方仍应处理失败回调。单向发送则无法确认 Broker 是否已成功
+处理和保存消息，只适合能够接受消息丢失的场景。
+
+#### SYNC 与 ASYNC 的共同点
+
+两者都是请求-响应通信，Broker 都会返回处理结果。它们也共用消息检查、Topic 路由、
+队列选择、消息压缩、请求构造、发送 Hook 和 Broker 存储等主流程。区别主要发生在请求
+发出之后：谁等待响应，以及结果如何交给业务代码。
+
+以默认发送 API 为例：
+
+```text
+SYNC
+业务线程 -> 路由、选队列、构造请求 -> invokeSync -> 等待并解析响应
+        <- 返回 SendResult 或抛出异常
+
+ASYNC
+业务线程 -> 提交发送任务 -> 返回
+异步发送线程 -> 路由、选队列、构造请求 -> invokeAsync -> 返回
+回调线程     <- Broker 响应 -> 解析响应 -> onSuccess / onException
+```
+
+| 对比项 | `SYNC` | `ASYNC` |
+| --- | --- | --- |
+| Producer API | `SendResult send(...)` | `void send(..., SendCallback)` |
+| 正常结果 | 方法返回值 | `onSuccess` |
+| 发送失败 | 向调用方抛出异常 | `onException` |
+| 业务线程 | 等待 Broker 响应 | 通常只提交任务，不等待响应 |
+| 默认外层发送次数 | `1 + retryTimesWhenSendFailed` | 1 |
+| 后续重试 | 在 `sendDefaultImpl` 循环中完成 | 在异步回调的 `onExceptionImpl` 中完成 |
+
+同步重试会重新选择队列，并优先避开上一次失败的 Broker。异步重试由
+`retryTimesWhenSendAsyncFailed` 控制；默认发送带有 Topic 路由时，当前源码也会调用
+`selectOneMessageQueue` 重新选队列，因此目标是否变化取决于路由和故障策略。
+
+`ASYNC` 的“不阻塞”特指不等待 Broker 响应，并不保证调用瞬间返回。开启异步背压后，
+业务线程可能等待在途消息数或消息字节数的 Semaphore；排队和等待时间也会消耗本次
+发送的 timeout 预算。参数检查、任务提交等调用阶段的错误仍可能直接抛出，网络发送和
+Broker 处理阶段的结果则通过 callback 返回。
 
 #### SYNC
 
