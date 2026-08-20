@@ -132,32 +132,28 @@ commitlog/
 
 **消息格式**（完整结构）：
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                              Message Format (Variable Length)                        │
-├──────────────┬──────────────────────────────────────────────────────────────────────┤
-│ Total Size   │ 4 bytes  │ 消息总长度                                                 │
-│ Magic Code   │ 4 bytes  │ 魔数 (MESSAGE_MAGIC_CODE = 0xdaa320a7)                    │
-│ Body CRC     │ 4 bytes  │ 消息体 CRC 校验值                                          │
-│ Queue ID     │ 4 bytes  │ 消息所在队列 ID                                            │
-│ Flag         │ 4 bytes  │ 消息标志位                                                 │
-│ Queue Offset │ 8 bytes  │ 在 ConsumeQueue 中的逻辑偏移量                              │
-│ Phys Offset  │ 8 bytes  │ 在 CommitLog 中的物理偏移量                                │
-│ Sys Flag     │ 4 bytes  │ 系统标志位（事务、延迟、地址类型等）                          │
-│ Born Time    │ 8 bytes  │ 消息生成时间戳                                             │
-│ Born Host    │ 8/20B    │ 消息生成地址（IPv4=8B, IPv6=20B）                           │
-│ Store Time   │ 8 bytes  │ 消息存储时间戳                                             │
-│ Store Host   │ 8/20B    │ 消息存储地址（IPv4=8B, IPv6=20B）                           │
-│ Reconsume    │ 4 bytes  │ 重试次数                                                   │
-│ Prepared Off │ 8 bytes  │ 事务消息的 Prepared 偏移量                                  │
-│ Body Length  │ 4 bytes  │ 消息体长度                                                 │
-│ Body         │ N bytes  │ 消息体内容                                                 │
-│ Topic Length │ 1/2B     │ Topic 名称长度（V1=1B, V2=2B）                              │
-│ Topic        │ X bytes  │ Topic 名称                                                │
-│ Props Length │ 2 bytes  │ 属性长度                                                   │
-│ Properties   │ Y bytes  │ 消息属性（Key、Tag、延迟级别等）                              │
-└──────────────┴──────────┴────────────────────────────────────────────────────────────┘
-```
+| 字段 | 大小 | 说明 |
+|------|------|------|
+| Total Size | 4 bytes | 消息总长度 |
+| Magic Code | 4 bytes | 魔数（`MESSAGE_MAGIC_CODE = 0xdaa320a7`） |
+| Body CRC | 4 bytes | 消息体 CRC 校验值 |
+| Queue ID | 4 bytes | 消息所在队列 ID |
+| Flag | 4 bytes | 消息标志位 |
+| Queue Offset | 8 bytes | 在 ConsumeQueue 中的逻辑偏移量 |
+| Phys Offset | 8 bytes | 在 CommitLog 中的物理偏移量 |
+| Sys Flag | 4 bytes | 系统标志位（事务、延迟、地址类型等） |
+| Born Time | 8 bytes | 消息生成时间戳 |
+| Born Host | 8/20 bytes | 消息生成地址（IPv4 为 8B，IPv6 为 20B） |
+| Store Time | 8 bytes | 消息存储时间戳 |
+| Store Host | 8/20 bytes | 消息存储地址（IPv4 为 8B，IPv6 为 20B） |
+| Reconsume | 4 bytes | 重试次数 |
+| Prepared Off | 8 bytes | 事务消息的 Prepared 偏移量 |
+| Body Length | 4 bytes | 消息体长度 |
+| Body | N bytes | 消息体内容 |
+| Topic Length | 1/2 bytes | Topic 名称长度（V1 为 1B，V2 为 2B） |
+| Topic | X bytes | Topic 名称 |
+| Props Length | 2 bytes | 属性长度 |
+| Properties | Y bytes | 消息属性（Key、Tag、延迟级别等） |
 
 **消息字段详细说明**：
 
