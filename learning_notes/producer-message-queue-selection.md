@@ -176,6 +176,78 @@ topic + brokerName + queueId
 - `DefaultMQProducerImpl.sendKernelImpl`
 - `SendMessageRequestHeader.setQueueId`
 
+## 重试时会切换 Broker 吗？
+
+**结论：不是固定的。同步发送重试时会切换 Broker，异步发送重试时默认在同一个 Broker 上重试。**
+
+### 同步发送（SYNC）— 会切换 Broker
+
+`DefaultMQProducerImpl.sendDefaultImpl()` 中
+（`client/src/main/java/org/apache/rocketmq/client/impl/producer/DefaultMQProducerImpl.java:756-766`）：
+
+```java
+int timesTotal = communicationMode == CommunicationMode.SYNC ? 1 + retryTimesWhenSendFailed : 1;
+for (; times < timesTotal; times++) {
+    String lastBrokerName = null == mq ? null : mq.getBrokerName();
+    ...
+    MessageQueue mqSelected = this.selectOneMessageQueue(topicPublishInfo, lastBrokerName, resetIndex);
+```
+
+每次重试都会把**上一次失败的 Broker 名**（`lastBrokerName`）传给队列选择器。
+在 `TopicPublishInfo.selectOneMessageQueue(lastBrokerName)`（第 109 行）中：
+
+```java
+for (int i = 0; i < this.messageQueueList.size(); i++) {
+    MessageQueue mq = selectOneMessageQueue();
+    if (!mq.getBrokerName().equals(lastBrokerName)) {
+        return mq;   // 优先选一个不同 Broker 的队列
+    }
+}
+return selectOneMessageQueue(); // 实在找不到才退回原逻辑
+```
+
+即：**优先选择与上次失败不同的 Broker**；只有当该 Topic 只部署在一个 Broker 上时才会退回
+同一个 Broker。此外 `MQFaultStrategy` 还会结合延迟故障规避（Broker 隔离），进一步避开有问题的
+Broker。
+
+### 异步发送（ASYNC）— 默认不换 Broker
+
+异步重试走的是 `MQClientAPIImpl.onExceptionImpl()`
+（`client/src/main/java/org/apache/rocketmq/client/impl/MQClientAPIImpl.java:719-730`）：
+
+```java
+String retryBrokerName = brokerName;//by default, it will send to the same broker
+if (topicPublishInfo != null) {
+    MessageQueue mqChosen = producer.selectOneMessageQueue(topicPublishInfo, brokerName, false);
+    retryBrokerName = instance.getBrokerNameFromMessageQueue(mqChosen);
+}
+```
+
+注意这里调用 `selectOneMessageQueue(topicPublishInfo, brokerName, false)` 时 `resetIndex=false`。
+而 `MQFaultStrategy` 在非重试路径下不会应用 `lastBrokerName` 过滤（该过滤只在 `sendDefaultImpl`
+的主循环里配合 `resetIndex=true` 生效），所以异步重试**通常仍在原来的 Broker 上重试**——官方文档
+也明确说明：“异步重试不会选择其他broker，仅在同一个broker上做重试”
+（见 `docs/cn/features.md:60`）。
+
+### 汇总
+
+| 发送方式 | 重试是否换 Broker | 控制参数 |
+| --- | --- | --- |
+| 同步 SYNC | ✅ 优先换到其他 Broker | `retryTimesWhenSendFailed`（默认 2） |
+| 异步 ASYNC | ❌ 默认同一 Broker | `retryTimesWhenSendAsyncFailed`（默认 2） |
+| ONEWAY | 无重试 | — |
+
+另外补充一点：即使换了 Broker，如果消息发送成功但返回的是 `FLUSH_DISK_TIMEOUT` /
+`SLAVE_NOT_AVAILABLE` 等状态，同步模式下还需 `retryAnotherBrokerWhenNotStoreOK=true`
+才会继续重试其他 Broker。
+
+相关源码：
+
+- `client/src/main/java/org/apache/rocketmq/client/impl/producer/DefaultMQProducerImpl.java`
+- `client/src/main/java/org/apache/rocketmq/client/impl/producer/TopicPublishInfo.java`
+- `client/src/main/java/org/apache/rocketmq/client/impl/MQClientAPIImpl.java`
+- `client/src/test/java/org/apache/rocketmq/client/producer/selector/SelectMessageQueueRetryTest.java`
+
 ## 自定义 Queue 选择
 
 默认发送不会根据消息 Key 或消息体做哈希。若业务要求相同业务键始终进入同一 Queue，
