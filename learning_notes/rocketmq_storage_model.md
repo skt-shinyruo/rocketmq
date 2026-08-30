@@ -121,7 +121,7 @@ CommitLog ──依赖──→ MappedFile ──借用──→ TransientStoreP
 
 ### 2.1 CommitLog
 
-**设计原理**：CommitLog 是 RocketMQ 的核心存储文件，所有 Topic 的消息按写入顺序集中存储在同一组文件中。这种设计最大化利用了磁盘顺序写的特性。
+**设计原理**：CommitLog 是 RocketMQ 的核心存储文件，所有 Topic 的消息按写入顺序集中存储在同一组文件中。这种设计充分利用了磁盘顺序写的特性。
 
 **文件命名规则**：文件名是 20 位数字，表示文件起始偏移量（左补零）
 
@@ -351,7 +351,7 @@ public boolean putKey(final String key, final long phyOffset, final long storeTi
 
 ### 2.4 TimerLog（延时消息存储）
 
-**设计原理**：TimerLog 是 RocketMQ 延时消息的存储（`timerWheelEnable` 默认 true），采用时间轮（TimerWheel）机制实现高效的延时消息管理。延时消息先存储在 TimerLog 文件中，TimerWheel 按时间槽管理消息的触发时机。
+**设计原理**：TimerLog 是 RocketMQ 延时消息的存储（`timerWheelEnable` 默认 true），与时间轮（TimerWheel）配合工作：消息先写入 TimerLog 文件，TimerWheel 按时间槽管理各消息的触发时机。
 
 **存储路径**：`$storePath/timerlog/`
 
@@ -1189,14 +1189,14 @@ public void recover(final boolean lastExitOK) {
 **CommitLog 容量计算**：
 
 ```
-存储容量 = 消息吞吐量 × 保留时间 × 消息平均大小 / 压缩率
+存储容量 = 消息吞吐量 × 保留时间 × 消息平均大小 / 有效利用率
 ```
 
 **示例**：
 - 吞吐量：10,000 msg/s
 - 保留时间：72 小时
 - 消息平均大小：1KB
-- 压缩率：0.8（PageCache 有效利用率）
+- 有效利用率：0.8（按 80% 可用空间估算，预留余量）
 
 ```
 存储容量 = 10,000 × 72 × 3600 × 1KB / 0.8 = 3.24TB
@@ -1481,7 +1481,7 @@ class CommitLogDispatcherBuildTransIndex implements CommitLogDispatcher {
 
 ### 12.1 Tag 过滤
 
-**设计原理**：Tag 过滤是 RocketMQ 最核心的过滤机制，基于 Tag 的哈希值实现快速过滤。
+**设计原理**：Tag 过滤是 RocketMQ 的基础过滤机制，通过比较 Tag 的哈希值快速过滤。
 
 **过滤流程**（主过滤在 Broker 端完成，Consumer 只做最终精确校验）：
 

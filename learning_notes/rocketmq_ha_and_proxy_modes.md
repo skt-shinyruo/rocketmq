@@ -28,7 +28,7 @@ Broker C (Follower)
 - 一致性较强，但多数派写入会增加延迟。
 - 它改变了 CommitLog 的实现和复制链路，侵入存储层较深。
 
-可以理解为：**让 Broker 数据本身成为一个 Raft 日志。**
+换个角度看，**DLedger 让 Broker 的数据本身成为一份 Raft 日志。**
 
 ## 二、Controller 模式
 
@@ -52,7 +52,7 @@ Broker A (Master)  <->  Broker B/C (Slave)
 - Broker 的 Master/Slave 角色可以动态变化。
 - 相比 DLedger，存储机制变化较小，也更适合 RocketMQ 5.x 的副本治理。
 
-可以理解为：**数据仍由 Broker 复制，Controller 只负责决定谁当 Master。**
+也就是说，**数据仍由 Broker 自己复制，Controller 只负责决定谁当 Master。**
 
 DLedger 与 Controller 是两套不同的 Broker 高可用方案，**且互斥、不能叠加使用**：
 `BrokerStartup` 启动时检查到 `enableControllerMode` 与 `enableDLegerCommitLog`

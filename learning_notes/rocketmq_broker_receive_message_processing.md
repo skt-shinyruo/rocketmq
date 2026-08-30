@@ -89,7 +89,7 @@ public boolean rejectRequest() {
   开启读写分离时刷盘跟不上写入。主动拒绝一部分流量是背压（backpressure）思想，
   保护 Broker 自身和已接受的请求。
 
-快速的价值：
+两种方式的对比：
 
 | 不做快速失败 | 快速失败 |
 | --- | --- |
@@ -155,7 +155,7 @@ flowchart LR
     E --> G[SendMessageThread_ 线程<br/>执行 processRequest]
 ```
 
-补充两点：
+补充三点：
 
 - **隔离设计**：不同业务用不同线程池——发送用 `sendMessageExecutor`、拉取用
   `pullMessageExecutor`、心跳用 `heartbeatExecutor` 等，互不拖累；发送卡顿不影响消费请求。

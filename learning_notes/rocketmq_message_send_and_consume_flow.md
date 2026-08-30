@@ -166,8 +166,8 @@ Producer 从可写 `QueueData` 生成发布队列时，还会确认同名 `Broke
 `brokerId=0` 的 Master。发送时先选择一个 `MessageQueue`，再通过 `broker-a` 找到
 `10.255.255.254:10911`，最终向这个地址发送请求。
 
-如果 Producer 日志出现连接 `10.255.255.254:10911` 失败，说明客户端无法访问
-Broker 注册到 NameServer、并对客户端公布的这个地址。此时应检查 Broker 所在网络
+如果 Producer 日志出现连接 `10.255.255.254:10911` 失败，说明客户端无法访问 Broker
+注册到 NameServer 并向客户端公布的这个地址。此时应检查 Broker 所在网络
 以及 `brokerIP1` 配置；不能只检查 NameServer 地址，因为 NameServer 返回的 Broker
 地址才是消息实际发送和拉取时连接的地址。
 
@@ -371,7 +371,7 @@ resetIndex = true
 `DefaultMQProducerImpl.selectOneMessageQueue` 自身没有选择算法，而是委托给：
 [MQFaultStrategy.java](../client/src/main/java/org/apache/rocketmq/client/latency/MQFaultStrategy.java)。
 
-默认 `sendLatencyEnable=false`，选择过程为：
+默认未开启延迟故障规避，选择过程为：
 
 1. 使用 `BrokerFilter` 排除 `brokerName == lastBrokerName` 的队列。
 2. 使用 `TopicPublishInfo.sendWhichQueue` 保存的线程本地索引进行轮询。
@@ -410,7 +410,7 @@ mqSelected = MessageQueue(topic, broker-a, queueId=2)
 
 ### 4.4 开启延迟故障规避后
 
-当 `sendLatencyEnable=true` 时，`MQFaultStrategy` 会结合之前发送记录的耗时和异常
+开启延迟故障规避后，`MQFaultStrategy` 会结合之前发送记录的耗时和异常
 状态选择，优先级如下：
 
 1. 选择“当前可用”并且不属于 `lastBrokerName` 的队列。

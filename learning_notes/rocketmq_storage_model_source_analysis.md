@@ -26,7 +26,7 @@ flowchart LR
 
 关键点：**ConsumeQueue 和 IndexFile 都只是 CommitLog 的派生视图**，宕机后可重放 dispatch 重建。
 
-这一点与 Kafka（每个分区一个独立日志）是本质区别：RocketMQ 用"写放大换顺序写"，换来极少的文件句柄和完全顺序的磁盘写入；代价是消费时多一次 CommitLog 随机读（靠 page cache 缓解）。
+这一点与 Kafka（每个分区一个独立日志）有本质区别：RocketMQ 用"写放大换顺序写"，换来极少的文件句柄和完全顺序的磁盘写入；代价是消费时多一次 CommitLog 随机读（靠 page cache 缓解）。
 
 ## 二、磁盘目录结构
 

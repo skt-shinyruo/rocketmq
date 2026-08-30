@@ -47,7 +47,7 @@ NameServer 返回 Topic 路由后，客户端在
 
 ## 默认策略：轮询并在重试时换 Broker
 
-默认配置 `sendLatencyEnable=false`。选择逻辑等价于：
+默认未开启延迟故障规避。选择逻辑等价于：
 
 ```java
 MessageQueue mq = tpInfo.selectOneMessageQueue(brokerFilter);
@@ -109,7 +109,12 @@ index = threadLocalIndex.incrementAndGet() % messageQueueList.size();
 
 ## 延迟故障规避策略
 
-开启 `sendLatencyEnable` 后，选择优先级变成：
+这个开关在源码里有两个入口：`ClientConfig` 的 `sendLatencyEnable`（系统属性
+`com.rocketmq.sendLatencyEnable`，`MQFaultStrategy` 构造时读取）和
+`DefaultMQProducer.setSendLatencyFaultEnable()`（运行时直接设置 `MQFaultStrategy`
+内部的同名标志）。两者控制的是同一个开关，下文统称"开启延迟故障规避"。
+
+开启后，选择优先级变成：
 
 ```text
 1. 不在隔离期，并且不是上次发送使用的 Broker
@@ -178,8 +183,8 @@ topic + brokerName + queueId
 
 ## 重试时会切换 Broker 吗？
 
-**结论：不是固定的。同步与异步发送重试时都会优先切换到其他 Broker**
-（若路由为空，或过滤后没有其他 Broker 的候选队列，会回退到完整队列列表，仍可能选回原 Broker）。
+不是固定的：同步与异步发送重试时都会优先切换到其他 Broker；
+若路由为空，或过滤后没有其他 Broker 的候选队列，会回退到完整队列列表，仍可能选回原 Broker。
 
 ### 同步发送（SYNC）— 会切换 Broker
 
@@ -240,7 +245,7 @@ if (topicPublishInfo != null) {
 | 异步 ASYNC | 会，优先换到其他 Broker（路由为空或无其他候选时可能回到原 Broker） | `retryTimesWhenSendAsyncFailed`（默认 2） |
 | ONEWAY | 无重试 | — |
 
-另外补充一点：即使换了 Broker，如果消息发送成功但返回的是 `FLUSH_DISK_TIMEOUT` /
+另外，即使换了 Broker，如果消息发送成功但返回的是 `FLUSH_DISK_TIMEOUT` /
 `SLAVE_NOT_AVAILABLE` 等状态，同步模式下还需 `retryAnotherBrokerWhenNotStoreOK=true`
 才会继续重试其他 Broker。
 

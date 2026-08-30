@@ -62,7 +62,7 @@ private SendResult sendDefaultImpl(Message msg, CommunicationMode communicationM
   - `MQBrokerException` → 只有响应码在 `retryResponseCodes` 中才重试；
   - `InterruptedException` → 直接抛出，不重试。
 
-### 2. 路由发现：`tryToFindTopicPublishInfo()`(894 行)
+### 2. 路由发现：`tryToFindTopicPublishInfo()`（894 行）
 
 ```java
 private TopicPublishInfo tryToFindTopicPublishInfo(final String topic) {
@@ -78,16 +78,16 @@ private TopicPublishInfo tryToFindTopicPublishInfo(final String topic) {
   向 NameServer 发送 `GET_ROUTEINFO_BY_TOPIC`(105)请求拉取路由。
 - 路由信息包含 Broker 地址表和该 Topic 的所有 `MessageQueue` 列表。
 
-### 3. 队列选择:`MQFaultStrategy.selectOneMessageQueue()`
+### 3. 队列选择：`MQFaultStrategy.selectOneMessageQueue()`
 
 文件：`client/src/main/java/org/apache/rocketmq/client/latency/MQFaultStrategy.java`
 
-- **故障规避开启**(`sendLatencyFaultEnable=true`):按"可用性过滤 + Broker 隔离"选队列。
+- **故障规避开启**（`sendLatencyFaultEnable=true`）：按"可用性过滤 + Broker 隔离"选队列。
   默认阈值中，延迟 `>= 550ms` 隔离 2 秒，`>= 15000ms` 隔离 30 秒。
-- **默认关闭**：随机递增取模轮询 `messageQueueList`;重试时通过 `lastBrokerName`
+- **默认关闭**：随机递增取模轮询 `messageQueueList`；重试时通过 `lastBrokerName`
   尽量避开上次失败的 Broker。
 
-### 4. 组装请求:`sendKernelImpl()`(911 行)
+### 4. 组装请求：`sendKernelImpl()`（911 行）
 
 ```java
 String brokerAddr = this.mQClientFactory.findBrokerAddressInPublish(brokerName);
@@ -104,9 +104,9 @@ if (this.tryToCompressMessage(msg)) { ... }    // body >= 4KB 时压缩
 3. 执行 `CheckForbiddenHook` / `SendMessageHook`(before)
 4. 按 SYNC/ASYNC 分发到 `MQClientAPIImpl.sendMessage()`
 
-### 5. 网络层:`MQClientAPIImpl.sendMessage()`
+### 5. 网络层：`MQClientAPIImpl.sendMessage()`
 
-文件：`client/src/main/java/org/apache/rocketmq/client/impl/MQClientAPIImpl.java`(534 行起)
+文件：`client/src/main/java/org/apache/rocketmq/client/impl/MQClientAPIImpl.java`（534 行起）
 
 ```java
 if (sendSmartMsg || msg instanceof MessageBatch) {
@@ -125,18 +125,18 @@ request.setBody(msg.getBody());
 | ASYNC | `invokeAsync` + `InvokeCallback` | 传输异常或响应解析为异常时由 `onExceptionImpl` 重试（`retryTimesWhenSendAsyncFailed`）；收到非 `SEND_OK` 的正常响应会回调成功并携带该状态 |
 | ONEWAY | `invokeOneway`,不等待响应 | 无重试、无结果 |
 
-最终由 `NettyRemotingClient` 通过 Netty Channel 写出，协议为自研 Remoting 协议(Header + Body)。
+最终由 `NettyRemotingClient` 通过 Netty Channel 写出，协议为自研 Remoting 协议（Header + Body）。
 
 ## 三、Broker 端阶段
 
-### 6. 请求分发:`SendMessageProcessor.processRequest()`
+### 6. 请求分发：`SendMessageProcessor.processRequest()`
 
 文件：`broker/src/main/java/org/apache/rocketmq/broker/processor/SendMessageProcessor.java`
 
-- 先为静态 Topic 建立上下文并执行 `rewriteRequestForStaticTopic`，随后调用 `sendMessage()` 中的 **前置校验**(`preSend`)：Broker 是否可写、Topic 是否存在、写权限和队列编号等
+- 先为静态 Topic 建立上下文并执行 `rewriteRequestForStaticTopic`，随后调用 `sendMessage()` 中的 **前置校验**（`preSend`）：Broker 是否可写、Topic 是否存在、写权限和队列编号等
 - `rejectRequest()` 在未启用 Slave acting master 的 Slave，或 PageCache 繁忙、TransientStorePool 不足时拒绝请求
 
-### 7. 核心处理:`sendMessage()`(243 行)
+### 7. 核心处理：`sendMessage()`（243 行）
 
 ```java
 MessageExtBrokerInner msgInner = new MessageExtBrokerInner();
@@ -158,12 +158,12 @@ if (brokerController.getBrokerConfig().isAsyncSendEnable()) {
 
 要点：
 
-- 重试消息(`%RETRY%` 前缀)走 `handleRetryAndDLQ`,超过最大重试次数则转死信 Topic `%DLQ%`
-- 事务半消息(`TRANSACTION_PREPARED_TYPE`)走 `TransactionalMessageService.asyncPrepareMessage`,
+- 重试消息（`%RETRY%` 前缀）走 `handleRetryAndDLQ`，超过最大重试次数则转死信 Topic `%DLQ%`
+- 事务半消息（`TRANSACTION_PREPARED_TYPE`）走 `TransactionalMessageService.asyncPrepareMessage`，
   存入特殊 topic `RMQ_SYS_TRANS_HALF_TOPIC`
 - `asyncSendEnable` 默认开启，控制的是 Broker 对发送请求的异步处理，不是刷盘模式。该分支在存储 future 完成后由 `putMessageFutureExecutor` 回写响应，避免阻塞 Netty IO 线程；关闭该开关时调用同步 `putMessage()`。
 
-### 8. 存储层:`DefaultMessageStore.asyncPutMessage()`
+### 8. 存储层：`DefaultMessageStore.asyncPutMessage()`
 
 文件：`store/src/main/java/org/apache/rocketmq/store/DefaultMessageStore.java`
 
@@ -188,7 +188,7 @@ Broker 返回的 ResponseCode 映射为 `SendStatus`(`processSendResponse`):
 
 ## 五、关键设计总结
 
-1. **重试与容错**:SYNC 对可重试异常和 `retryResponseCodes` 中的响应码最多尝试 3 次；每次重新选队列并尽量避开上次 Broker。非 `SEND_OK` 的成功响应是否重试由 `retryAnotherBrokerWhenNotStoreOK` 决定，默认关闭
+1. **重试与容错**：SYNC 对可重试异常和 `retryResponseCodes` 中的响应码最多尝试 3 次；每次重新选队列并尽量避开上次 Broker。非 `SEND_OK` 的成功响应是否重试由 `retryAnotherBrokerWhenNotStoreOK` 决定，默认关闭
 2. **超时贯穿全程**：从 `send()` 到网络层逐级扣减剩余时间，保证总超时可控
-3. **顺序写 CommitLog**:同一 Broker 的消息混合顺序写入 CommitLog 文件序列，消费索引异步构建
-4. **Hook 机制**:`SendMessageHook` 支持消息轨迹(trace)等扩展能力
+3. **顺序写 CommitLog**：同一 Broker 的消息混合顺序写入 CommitLog 文件序列，消费索引异步构建
+4. **Hook 机制**：`SendMessageHook` 支持消息轨迹（trace）等扩展能力

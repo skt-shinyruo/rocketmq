@@ -52,8 +52,8 @@ sequenceDiagram
 | 20s | `rocketmq.client.rebalance.waitInterval`（20000ms） | 触发 `doRebalance()` | `RebalanceService.java:25` |
 | 5s | `persistConsumerOffsetInterval`（5000ms） | 批量持久化消费位点 `UPDATE_CONSUMER_OFFSET` | `ClientConfig.java:66`；任务注册在 `MQClientInstance.java:369` |
 
-另外还有一个图中未画出但同样重要的：心跳 `heartbeatBrokerInterval`（默认 30s，
-`ClientConfig.java:62`），负责向所有 Broker 发送心跳包维持消费者注册状态。
+图中没有画出的还有心跳：`heartbeatBrokerInterval`（默认 30s，
+`ClientConfig.java:62`），负责向所有 Broker 发送心跳，维持消费者注册状态。
 
 ## 三、逐请求分解
 

@@ -18,19 +18,19 @@ public class MessageQueue implements Serializable {
 
 `MessageQueue` 类不校验 `queueId` 的范围。普通 Topic 的生产路由使用 `writeQueueNums`，消费路由使用 `readQueueNums`；两者是独立配置。
 
-## 关键理解点
+## 关键点
 
 1. **Topic 与 Broker 之间的桥梁**：一个 Topic 分布在多个 Broker 上，每个 Broker 上有若干个队列。`MessageQueue` 唯一确定了"某个 Topic 在某个 Broker 上的第 N 个队列"。
 
 2. **并行度的基本单位**：
-   - **发送端**: Producer 从发布路由中的 `MessageQueue` 选择一个写入。
+   - **发送端**：Producer 从发布路由的 `MessageQueue` 列表中选一个写入。
    - **消费端**: 集群消费时，Rebalance 将一个 `MessageQueue` 分配给同组的一个消费者**实例**。并发监听器仍可让该队列的多个批次在本地线程池并行执行；只有顺序监听器会在本地串行消费该队列。
 
 3. **与存储的对应关系**：
    - 对普通 Topic 而言，某个 Broker 上的 `topic + queueId` 对应一个消费索引队列（实现可为 `ConsumeQueue` 或 `BatchConsumeQueue`）。
    - 消息先顺序写入**该 Broker** 的 CommitLog 文件序列，再由 Reput 服务异步构建消费索引和 Key 索引。
 
-4. **路由表中的体现**:`TopicPublishInfo` 中持有 `List<MessageQueue>`,Producer 发送时从中选一个：
+4. **路由表中的体现**：`TopicPublishInfo` 中持有 `List<MessageQueue>`，Producer 发送时从中选一个：
 
 ```mermaid
 graph LR
@@ -42,7 +42,7 @@ graph LR
     C --> C1["queueId=1"]
 ```
 
-上图中每个叶子节点就是一个 `MessageQueue`,共 4 个。
+上图中每个叶子节点就是一个 `MessageQueue`，共 4 个。
 
 ## 典型使用场景
 
