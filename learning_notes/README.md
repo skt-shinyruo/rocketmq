@@ -8,6 +8,7 @@
 - [Producer 与 Broker/NameServer 的通信全景](rocketmq_producer_broker_communication.md)
 - [Broker 收到 Producer 消息后的处理全流程](rocketmq_broker_receive_message_processing.md)
 - [MessageQueue 概念详解](messagequeue-concept.md)
+- [RocketMQ Read Queue 与 Write Queue](rocketmq_read_write_queue.md)
 - [Producer MessageQueue 选择逻辑](producer-message-queue-selection.md)
 - [RocketMQ 发送重试、重复消息与幂等](rocketmq_send_retry_and_idempotency.md)
 - [RocketMQ 顺序消息：生产投递与因果顺序](rocketmq_ordered_message.md)

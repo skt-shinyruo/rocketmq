@@ -55,6 +55,7 @@ graph LR
 
 ## 相关笔记
 
+- [RocketMQ Read Queue 与 Write Queue](rocketmq_read_write_queue.md) —— 生产路由用 writeQueueNums、消费路由用 readQueueNums 的原理与运维场景
 - [Producer MessageQueue 选择逻辑](producer-message-queue-selection.md) —— Producer 如何在这些 MessageQueue 中做选择
 - [RocketMQ 顺序消息：生产投递与因果顺序](rocketmq_ordered_message.md) —— 按 Sharding Key 固定队列及同一订单的发送时序
 - [RocketMQ 消息存储模型详解](rocketmq_storage_model.md) —— MessageQueue 与 CommitLog/ConsumeQueue 的存储对应关系
