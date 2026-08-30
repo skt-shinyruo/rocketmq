@@ -202,7 +202,7 @@ ConsumeQueue    按 Topic/Queue 建立消费顺序索引
 IndexFile       按 Key 建立查询索引
 ```
 
-一句话总结：
+按 Key 查询的完整路径：
 
 ```text
 消息 Key

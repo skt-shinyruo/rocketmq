@@ -115,7 +115,7 @@ rebalance 后新接管一个队列时，先查 Broker 端该队列上次消费�
 ——NameServer 只维护 Broker 级路由元数据，从不感知消费者个体，所以图中最后一步
 没有连到 NameServer 的线。
 
-## 四、几个值得记住的设计点
+## 四、设计要点
 
 1. **NameServer 参与度极低**：全图只有第 1 步经过它。路由元数据在 NameServer，
    消息与消费状态全在 Broker 侧闭环，NameServer 无状态、互不通信的设计得以成立。

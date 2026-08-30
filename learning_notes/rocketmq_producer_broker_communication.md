@@ -57,7 +57,7 @@ sequenceDiagram
 - `HEART_BEAT`（34）：`MQClientInstance` 每 30s 向所有 Broker 注册客户端信息（Producer 无消费信息也注册）。
 - 关闭时 `unregisterClient`。
 
-## 一句话总结
+## 小结
 
 普通发送 = 1 次 NameServer 路由查询（可缓存省略）+ N 次（含重试）对 Broker 的 `SEND_MESSAGE(_V2)` 请求-响应；事务消息额外多一次 `END_TRANSACTION` ONEWAY。
 

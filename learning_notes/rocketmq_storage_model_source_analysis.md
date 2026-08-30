@@ -246,6 +246,6 @@ flowchart TD
 
 ## 八、总结
 
-一句话概括 RocketMQ 存储模型：**以单个全局 CommitLog 顺序日志为唯一事实源（Source of Truth），ConsumeQueue 和 IndexFile 都是从它派生、可随时重建的索引视图；写入靠 mmap + 组提交刷盘保证顺序写吞吐，读取靠 page cache + tag 预过滤弥补随机读代价；可靠性靠 checkpoint + 重放 dispatch 恢复，靠 abort 文件区分正常/异常退出**。
+RocketMQ 存储模型可以概括为：**以单个全局 CommitLog 顺序日志为唯一事实源（Source of Truth），ConsumeQueue 和 IndexFile 都是从它派生、可随时重建的索引视图；写入靠 mmap + 组提交刷盘保证顺序写吞吐，读取靠 page cache + tag 预过滤弥补随机读代价；可靠性靠 checkpoint + 重放 dispatch 恢复，靠 abort 文件区分正常/异常退出**。
 
 这个"日志 + 派生视图"的结构，是把 Kafka 的分区日志模型改造成"全局单日志"后的产物。理解了这一点，store 模块里所有组件（MappedFileQueue、ReputMessageService、CleanCommitLogService、StoreCheckpoint）的职责就都顺理成章了。

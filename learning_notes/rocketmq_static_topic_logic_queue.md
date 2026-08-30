@@ -1,4 +1,4 @@
-# RocketMQ 静态主题（Static Topic / Logic Queue）教学文档
+# RocketMQ 静态主题（Static Topic / Logic Queue）
 
 > 本文整理自对 `docs/cn/statictopic/RocketMQ_Static_Topic_Logic_Queue_设计.md`、
 > `TopicQueueMappingManager`、`SendMessageProcessor`、`LogicQueueMappingItem` 等源码的阅读，
@@ -563,7 +563,7 @@ $$\text{逻辑位点} = \text{logicOffset} + (\text{物理位点} - \text{startO
 换取"`hash(key) mod N` 中 N 永不变、扩容不影响分片映射"这个核心目标——
 对顺序消息、流计算这类强依赖固定分片的场景来说，这笔交换是值得的。
 
-一句话总结：**为了换取"扩缩容时 `hash(key) mod N` 不变"（第五章的核心目标），
+小结：**为了换取"扩缩容时 `hash(key) mod N` 不变"（第五章的核心目标），
 静态主题把位点从"物理文件上的精确计数器"变成了"跨机器拼接出来的逻辑序列"，
 拼接缝对不齐就会跳号——这是本章所说"这层间接性不是免费的"的第一笔代价。**
 

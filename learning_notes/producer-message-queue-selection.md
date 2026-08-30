@@ -236,8 +236,8 @@ if (topicPublishInfo != null) {
 
 | 发送方式 | 重试是否换 Broker | 控制参数 |
 | --- | --- | --- |
-| 同步 SYNC | ✅ 优先换到其他 Broker | `retryTimesWhenSendFailed`（默认 2） |
-| 异步 ASYNC | ✅ 优先换到其他 Broker（路由为空或无其他候选时可能回到原 Broker） | `retryTimesWhenSendAsyncFailed`（默认 2） |
+| 同步 SYNC | 会，优先换到其他 Broker | `retryTimesWhenSendFailed`（默认 2） |
+| 异步 ASYNC | 会，优先换到其他 Broker（路由为空或无其他候选时可能回到原 Broker） | `retryTimesWhenSendAsyncFailed`（默认 2） |
 | ONEWAY | 无重试 | — |
 
 另外补充一点：即使换了 Broker，如果消息发送成功但返回的是 `FLUSH_DISK_TIMEOUT` /

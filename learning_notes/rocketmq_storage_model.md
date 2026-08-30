@@ -144,31 +144,6 @@ commitlog/
 **消息格式**（完整结构）：
 
 | 字段 | 大小 | 说明 |
-|------|------|------|
-| Total Size | 4 bytes | 消息总长度 |
-| Magic Code | 4 bytes | 魔数（`MESSAGE_MAGIC_CODE = 0xdaa320a7`） |
-| Body CRC | 4 bytes | 消息体 CRC 校验值 |
-| Queue ID | 4 bytes | 消息所在队列 ID |
-| Flag | 4 bytes | 消息标志位 |
-| Queue Offset | 8 bytes | 在 ConsumeQueue 中的逻辑偏移量 |
-| Phys Offset | 8 bytes | 在 CommitLog 中的物理偏移量 |
-| Sys Flag | 4 bytes | 系统标志位（事务、延迟、地址类型等） |
-| Born Time | 8 bytes | 消息生成时间戳 |
-| Born Host | 8/20 bytes | 消息生成地址（IPv4 为 8B，IPv6 为 20B） |
-| Store Time | 8 bytes | 消息存储时间戳 |
-| Store Host | 8/20 bytes | 消息存储地址（IPv4 为 8B，IPv6 为 20B） |
-| Reconsume | 4 bytes | 重试次数 |
-| Prepared Off | 8 bytes | 事务消息的 Prepared 偏移量 |
-| Body Length | 4 bytes | 消息体长度 |
-| Body | N bytes | 消息体内容 |
-| Topic Length | 1/2 bytes | Topic 名称长度（V1 为 1B，V2 为 2B） |
-| Topic | X bytes | Topic 名称 |
-| Props Length | 2 bytes | 属性长度 |
-| Properties | Y bytes | 消息属性（Key、Tag、延迟级别等） |
-
-**消息字段详细说明**：
-
-| 字段 | 大小 | 说明 |
 |-----|------|-----|
 | **Total Size** | 4 bytes | 消息总长度 |
 | **Magic Code** | 4 bytes | 魔数，`MESSAGE_MAGIC_CODE = -626843481` (0xdaa320a7) |
@@ -191,7 +166,7 @@ commitlog/
 | **Props Length** | 2 bytes | 属性长度 |
 | **Properties** | Y bytes | 消息属性（Key、Tag、延迟级别等） |
 
-**核心代码**（[CommitLog.java](file:///home/feng/code/opensource/rocketmq/store/src/main/java/org/apache/rocketmq/store/CommitLog.java)）：
+**核心代码**（[CommitLog.java](../store/src/main/java/org/apache/rocketmq/store/CommitLog.java)）：
 
 ```java
 public CompletableFuture<PutMessageResult> asyncPutMessage(MessageExtBrokerInner msg) {
@@ -271,7 +246,7 @@ consumequeue/
 
 当启用 `enableConsumeQueueExt` 时，ConsumeQueue 还会维护扩展索引文件，存储额外的过滤信息（如 Tag 位图），支持更精确的消息过滤。
 
-**核心代码**（[ConsumeQueue.java](file:///home/feng/code/opensource/rocketmq/store/src/main/java/org/apache/rocketmq/store/ConsumeQueue.java)）：
+**核心代码**（[ConsumeQueue.java](../store/src/main/java/org/apache/rocketmq/store/ConsumeQueue.java)）：
 
 ```java
 public static final int CQ_STORE_UNIT_SIZE = 20;
@@ -319,14 +294,6 @@ IndexFile
         └── NextIndexOffset│ 4 bytes  │ 下一个索引的偏移量
 ```
 
-**文件区域详解**：
-
-| 区域 | 大小 | 说明 |
-|-----|------|-----|
-| **Header** | 40 bytes | 元数据（时间范围、物理偏移范围、槽数、索引数） |
-| **Hash Slot** | 20,000,000 bytes | 500 万个哈希槽，存储链表头指针 |
-| **Index Data** | 400,000,000 bytes | 2000 万个索引条目 |
-
 **哈希索引结构**（链表法解决哈希冲突）：
 
 ```
@@ -349,7 +316,7 @@ Hash Slot Table
 - 若消息设置了 `UNIQ_KEY`，则用 `topic + "#" + UNIQ_KEY` 作为索引键
 - 若消息设置了 `KEYS`（多个用空格分隔），则对每个 KEY 创建索引 `topic + "#" + KEY`
 
-**核心代码**（[IndexFile.java](file:///home/feng/code/opensource/rocketmq/store/src/main/java/org/apache/rocketmq/store/index/IndexFile.java)）：
+**核心代码**（[IndexFile.java](../store/src/main/java/org/apache/rocketmq/store/index/IndexFile.java)）：
 
 ```java
 public boolean putKey(final String key, final long phyOffset, final long storeTimestamp) {
@@ -390,24 +357,6 @@ public boolean putKey(final String key, final long phyOffset, final long storeTi
 
 **TimerLog 单元结构**（每条 52 bytes）：
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                      TimerLog Entry (52 bytes)                                  │
-├─────────────────────────┬───────────────────────────────────────────────────────┤
-│ Size                    │ 4 bytes  │ 单元大小                                   │
-│ Prev Position           │ 8 bytes  │ 前一个单元位置（链表结构）                  │
-│ Magic Value             │ 4 bytes  │ 魔数，用于校验                              │
-│ Write Time              │ 8 bytes  │ 写入时间戳，用于追踪                        │
-│ Delayed Time            │ 4 bytes  │ 延迟时间（秒）                              │
-│ CommitLog Offset        │ 8 bytes  │ 对应的 CommitLog 物理偏移量                 │
-│ Message Size            │ 4 bytes  │ 消息大小                                   │
-│ Topic Hash              │ 4 bytes  │ 真实 Topic 的哈希值                        │
-│ Reserved                │ 8 bytes  │ 预留字段                                   │
-└─────────────────────────┴──────────┴────────────────────────────────────────────┘
-```
-
-**TimerLog 单元字段**：
-
 | 字段 | 大小 | 说明 |
 |-----|------|-----|
 | **Size** | 4 bytes | 单元大小 |
@@ -425,17 +374,8 @@ public boolean putKey(final String key, final long phyOffset, final long storeTi
 ```
 TimerWheel (时间轮存储文件)
 ├── Slot[0]  ──→  TimerLog Entry1  ──→  TimerLog Entry2  ──→  NULL
-│   ├── delayTime  │ 8 bytes  │ 延迟时间点
-│   ├── firstPos   │ 8 bytes  │ 该槽第一条消息在 TimerLog 中的位置
-│   ├── lastPos    │ 8 bytes  │ 该槽最后一条消息在 TimerLog 中的位置
-│   ├── num        │ 4 bytes  │ 该槽消息数量
-│   └── magic      │ 4 bytes  │ 魔数
-│
 ├── Slot[1]  ──→  TimerLog Entry3  ──→  NULL
-│   └── ...
-│
 └── Slot[N]  ──→  NULL
-    └── ...
 
 时间轮工作原理：
 1. 每个 Slot 对应一个时间槽，时间跨度由 timerPrecisionMs 决定（默认 1000ms）
@@ -472,7 +412,7 @@ TimerWheel (时间轮存储文件)
 | `timerRollWindowSlot` | 172800 | 滚动窗口槽数（2天） |
 | `timerMaxDelaySec` | 259200 | 最大延迟时间（3天） |
 
-**核心代码**（[TimerLog.java](file:///home/feng/code/opensource/rocketmq/store/src/main/java/org/apache/rocketmq/store/timer/TimerLog.java) / [Slot.java](file:///home/feng/code/opensource/rocketmq/store/src/main/java/org/apache/rocketmq/store/timer/Slot.java)）：
+**核心代码**（[TimerLog.java](../store/src/main/java/org/apache/rocketmq/store/timer/TimerLog.java) / [Slot.java](../store/src/main/java/org/apache/rocketmq/store/timer/Slot.java)）：
 
 ```java
 public final static int UNIT_SIZE = 4  //size
@@ -527,7 +467,7 @@ RocketMQ 支持并发构建 ConsumeQueue，通过配置 `enableBuildConsumeQueue
 
 **CommitLogDispatcher 链模式**：
 
-ReputMessageService 通过 `dispatcherList` 链式调用多个 `CommitLogDispatcher` 实现，每个 Dispatcher 负责构建不同类型的索引。这种设计实现了职责分离和可扩展性。
+ReputMessageService 通过 `dispatcherList` 链式调用多个 `CommitLogDispatcher` 实现，每个 Dispatcher 负责构建不同类型的索引。
 
 ```
 dispatcherList 链式调用顺序：
@@ -549,7 +489,7 @@ ReputService ──→ CommitLogDispatcherBuildConsumeQueue ──→ CommitLogD
 | **CommitLogDispatcherBuildTransIndex** | 构建事务消息索引 | 默认注册，但仅 `transRocksDBEnable=true`（默认 false）时实际生效 |
 | **CommitLogDispatcherCompaction** | Compaction 分发 | `enableCompaction=true`（默认 true）时注册 |
 
-**核心代码**（[DefaultMessageStore.java](file:///home/feng/code/opensource/rocketmq/store/src/main/java/org/apache/rocketmq/store/DefaultMessageStore.java)）：
+**核心代码**（[DefaultMessageStore.java](../store/src/main/java/org/apache/rocketmq/store/DefaultMessageStore.java)）：
 
 ```java
 private final LinkedList<CommitLogDispatcher> dispatcherList = new LinkedList<>();
@@ -606,7 +546,7 @@ for (CommitLogDispatcher dispatcher : this.dispatcherList) {
 特点：延迟低、吞吐量高，但断电可能丢失数据
 ```
 
-**核心代码**（[FlushManager.java](file:///home/feng/code/opensource/rocketmq/store/src/main/java/org/apache/rocketmq/store/FlushManager.java)）：
+**核心代码**（[FlushManager.java](../store/src/main/java/org/apache/rocketmq/store/FlushManager.java)）：
 
 ```java
 public interface FlushManager {
@@ -640,7 +580,7 @@ public interface FlushManager {
 
 当配置 `warmMapedFileEnable` 为 true 时，新分配的 MappedFile 会进行预热，预先将文件内容加载到 PageCache，避免首次访问时的缺页中断。
 
-**核心代码**（[AllocateMappedFileService.java](file:///home/feng/code/opensource/rocketmq/store/src/main/java/org/apache/rocketmq/store/AllocateMappedFileService.java)）：
+**核心代码**（[AllocateMappedFileService.java](../store/src/main/java/org/apache/rocketmq/store/AllocateMappedFileService.java)）：
 
 ```java
 public MappedFile putRequestAndReturnMappedFile(String nextFilePath, String nextNextFilePath, int fileSize) {
@@ -702,7 +642,7 @@ public MappedFile putRequestAndReturnMappedFile(String nextFilePath, String next
 - 内存池复用，减少内存分配/释放开销
 - 消息先写入堆外缓冲区，再异步提交到 PageCache
 
-**核心代码**（[TransientStorePool.java](file:///home/feng/code/opensource/rocketmq/store/src/main/java/org/apache/rocketmq/store/TransientStorePool.java)）：
+**核心代码**（[TransientStorePool.java](../store/src/main/java/org/apache/rocketmq/store/TransientStorePool.java)）：
 
 ```java
 public void init() {
@@ -782,7 +722,7 @@ public ByteBuffer borrowBuffer() {
 | 32 | 8 bytes | confirmPhyOffset | 已确认偏移量 |
 | 40 | 8 bytes | logicsPhysicalOffset | ConsumeQueue 对应的物理偏移量 |
 
-**核心代码**（[StoreCheckpoint.java](file:///home/feng/code/opensource/rocketmq/store/src/main/java/org/apache/rocketmq/store/StoreCheckpoint.java)）：
+**核心代码**（[StoreCheckpoint.java](../store/src/main/java/org/apache/rocketmq/store/StoreCheckpoint.java)）：
 
 ```java
 public void flush() {
@@ -926,7 +866,7 @@ MessageId 的长度取决于 Broker 地址类型：
 | 端口号 | 4 bytes | Broker 端口（Int） |
 | CommitLog 偏移量 | 8 bytes | 物理偏移量 |
 
-**核心代码**（[MessageDecoder.java](file:///home/feng/code/opensource/rocketmq/common/src/main/java/org/apache/rocketmq/common/message/MessageDecoder.java)）：
+**核心代码**（[MessageDecoder.java](../common/src/main/java/org/apache/rocketmq/common/message/MessageDecoder.java)）：
 
 ```java
 public static String createMessageId(final ByteBuffer input, final ByteBuffer addr, final long offset) {
@@ -1009,7 +949,7 @@ NameServer
 
 RocketMQ 4.5+ 支持 DLedger 模式，基于 Raft 协议实现多副本数据一致性，自动选主，无需手动配置 Master/Slave。
 
-**核心代码**（[HAService.java](file:///home/feng/code/opensource/rocketmq/store/src/main/java/org/apache/rocketmq/store/ha/HAService.java)）：
+**核心代码**（[HAService.java](../store/src/main/java/org/apache/rocketmq/store/ha/HAService.java)）：
 
 `HAService`/`HAClient`/`HAConnection` 均为接口，默认实现为 `DefaultHAService`/`DefaultHAClient`/`DefaultHAConnection`（Controller 模式下由 `AutoSwitchHAService` 提供自动主从切换）：
 
@@ -1469,7 +1409,7 @@ RocketMQ 使用内部系统 Topic 存储事务消息，而非独立的事务表�
 | `RMQ_SYS_TRANS_OP_HALF_TOPIC` | 存储操作消息（Commit/Rollback 指令） |
 | `RMQ_SYS_ROCKSDB_TRANS_OP_HALF_TOPIC` | RocksDB 事务 Topic 模式下存储操作消息 |
 
-**存储实现**（[TransactionalMessageBridge.java](file:///home/feng/code/opensource/rocketmq/broker/src/main/java/org/apache/rocketmq/broker/transaction/queue/TransactionalMessageBridge.java)）：
+**存储实现**（[TransactionalMessageBridge.java](../broker/src/main/java/org/apache/rocketmq/broker/transaction/queue/TransactionalMessageBridge.java)）：
 
 - 默认半消息写入 `RMQ_SYS_TRANS_HALF_TOPIC`，不构建消费索引，对 Consumer 不可见；当
   `transRocksDBEnable=true` 且 `transWriteOriginTransHalfEnable=false` 时，改写为
@@ -1488,7 +1428,7 @@ RocketMQ 使用内部系统 Topic 存储事务消息，而非独立的事务表�
 
 ### 11.3 事务索引构建
 
-**CommitLogDispatcherBuildTransIndex**（[DefaultMessageStore.java](file:///home/feng/code/opensource/rocketmq/store/src/main/java/org/apache/rocketmq/store/DefaultMessageStore.java)）：
+**CommitLogDispatcherBuildTransIndex**（[DefaultMessageStore.java](../store/src/main/java/org/apache/rocketmq/store/DefaultMessageStore.java)）：
 
 ReputMessageService 通过 `CommitLogDispatcherBuildTransIndex` 构建事务索引，仅当启用 RocksDB 事务存储时生效：
 
@@ -1563,7 +1503,7 @@ MessageFilter/DefaultMessageFilter 执行）
 Consumer 收到消息后按 Tag 字符串精确校验（Hash 可能碰撞），不匹配则丢弃
 ```
 
-**Tag Hash 计算**（[MessageExtBrokerInner.java](file:///home/feng/code/opensource/rocketmq/common/src/main/java/org/apache/rocketmq/common/message/MessageExtBrokerInner.java)）：
+**Tag Hash 计算**（[MessageExtBrokerInner.java](../common/src/main/java/org/apache/rocketmq/common/message/MessageExtBrokerInner.java)）：
 
 ```java
 public static long tagsString2tagsCode(final TopicFilterType filter, final String tags) {
@@ -1752,7 +1692,7 @@ Pull 消息时先读取 ConsumeQueue 索引
 
 ## 十五、总结
 
-RocketMQ 的存储模型是其高性能和高可靠性的核心保障，具有以下特点：
+RocketMQ 存储模型的要点：
 
 1. **混合型存储架构**：CommitLog 集中存储 + ConsumeQueue/IndexFile 索引分离，最大化顺序写效率
 2. **零拷贝技术**：Mmap 内存映射减少数据拷贝，TransientStorePool 堆外内存优化
@@ -1760,5 +1700,3 @@ RocketMQ 的存储模型是其高性能和高可靠性的核心保障，具有�
 4. **多级可靠性保障**：同步/异步刷盘 + Master/Slave 复制 + DLedger Raft 协议
 5. **灵活的存储管理**：支持多路径、冷热分离、过期删除、RocksDB 插件
 6. **完善的恢复机制**：StoreCheckpoint + 魔数/CRC 校验 + 索引重建
-
-这种设计在保证数据可靠性的同时，实现了极高的消息写入和读取吞吐量，适合大规模分布式消息场景。

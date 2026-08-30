@@ -142,8 +142,7 @@ msg.setTopic(withNamespace(msg.getTopic()));
 地址，这个 `finally` 都不会执行，调用方 Message 的 Topic 可能仍带 namespace。
 批量路径还有一层例外：显式 Batch 和 autoBatch 都可能先给原始单条 Message 写入
 namespace，kernel 的 `finally` 恢复的是新建的 `MessageBatch` wrapper，不会逐条恢复
-原始 Message 的 Topic。
-实践上不要并发复用并修改同一个 `Message` 实例。
+原始 Message 的 Topic。因此实践中不要并发复用并修改同一个 `Message` 实例。
 
 ### 3.2 autoBatch 只覆盖部分重载
 
@@ -997,7 +996,7 @@ send timeout
 重试机会，当前单次请求最多使用这个值，给后续尝试留出机会；最后一次仍可使用全部
 剩余预算。
 
-但当前实现有几处不能被统一成严格的端到端 deadline：
+但当前实现有几处无法统一成严格的端到端 deadline：
 
 1. NameServer 路由 RPC 使用独立的 `mqClientApiTimeout`，默认也是 3000 ms，而不是
    调用方传入的 send timeout。路由调用返回后，发送链才检查总耗时是否已超。

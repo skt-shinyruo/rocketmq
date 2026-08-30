@@ -13,6 +13,6 @@
 - [RocketMQ 消息存储模型详解](rocketmq_storage_model.md)
 - [RocketMQ 存储模型源码导读（含 Mermaid 图）](rocketmq_storage_model_source_analysis.md)
 - [RocketMQ IndexFile 工作原理](rocketmq_indexfile.md)
-- [RocketMQ 静态主题（Static Topic / Logic Queue）教学文档](rocketmq_static_topic_logic_queue.md)
+- [RocketMQ 静态主题（Static Topic / Logic Queue）](rocketmq_static_topic_logic_queue.md)
 - [RocketMQ 本地源码 Debug](rocketmq_local_source_debug.md)
 - [RocketMQ DefaultMQPushConsumer Pull 消费流程分析](consumer_flow_analysis.md)
