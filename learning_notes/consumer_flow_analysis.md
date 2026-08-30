@@ -286,14 +286,20 @@ switch (pullResult.getPullStatus()) {
 `ProcessQueue` 是队列的消息快照，内部使用 `TreeMap<Long, MessageExt>` 按 offset 排序存储消息。
 
 ```java
-// ProcessQueue.java
+// ProcessQueue.java（主要字段，节选）
 public class ProcessQueue {
-    private final TreeMap<Long, MessageExt> msgTreeMap;     // 消息缓存
-    private final AtomicLong msgCount;                       // 消息计数
-    private final AtomicLong msgSize;                        // 消息大小
-    private volatile boolean dropped = false;                // 是否被丢弃
-    private volatile boolean locked = false;                 // 是否锁定(顺序消费)
-    private volatile boolean consuming = false;              // 是否正在消费
+    private final TreeMap<Long, MessageExt> msgTreeMap;      // 消息缓存（并发）
+    private final TreeMap<Long, MessageExt> consumingMsgOrderlyTreeMap; // 顺序消费专用缓存
+    private final AtomicLong msgCount;                        // 消息计数
+    private final AtomicLong msgSize;                         // 消息大小
+    private volatile long queueOffsetMax = 0L;                // 已见最大 offset
+    private volatile boolean dropped = false;                 // 是否被丢弃
+    private volatile boolean locked = false;                  // 是否锁定(顺序消费)
+    private volatile boolean consuming = false;               // 是否正在消费(并发)
+    private final ReadWriteLock treeMapLock = new ReentrantReadWriteLock(); // 保护两个 TreeMap
+    private final ReentrantLock consumeLock = new ReentrantLock(); // 顺序消费取消息锁
+    private volatile long lastPullTimestamp = System.currentTimeMillis();
+    private volatile long lastLockTimestamp = System.currentTimeMillis();  // 锁续期判断依据
 }
 ```
 
@@ -541,7 +547,7 @@ this.submitConsumeRequestLater(processQueue, mq,
 
 ### 7.3 死信队列
 
-并发消费由 Broker 在处理发回请求时判断重试次数；顺序消费达到上限时，客户端会把消息作为普通消息发往 `%RETRY%<consumerGroup>`。Broker 的 `handleRetryAndDLQ` 再将超过上限的消息改投 `%DLQ%<consumerGroup>`，因此客户端并不直接写 DLQ：
+并发消费由 Broker 在处理发回请求时判断重试次数；顺序消费达到上限时，客户端会把消息作为普通消息发往 `%RETRY%<consumerGroup>`（携带 `PROPERTY_MAX_RECONSUME_TIMES`）。Broker 的 `handleRetryAndDLQ` 再将超过上限的消息改投 `%DLQ%<consumerGroup>`，因此客户端并不直接写 DLQ。另外 Broker 对顺序消息还有一条直达 DLQ 的分支：发回请求到达时若该消费组的重平衡锁未过期（判定为顺序消息，`!rebalanceLockManager.isLockAllExpired(group)`），消息会被**直接**改投 `%DLQ%<group>` 而不再走 `%RETRY%`：
 
 ```java
 // ConsumeMessageOrderlyService.checkReconsumeTimes  [line 360]

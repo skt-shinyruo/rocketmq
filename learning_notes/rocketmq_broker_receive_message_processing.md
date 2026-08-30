@@ -108,7 +108,7 @@ public boolean rejectRequest() {
 
 ```java
 this.sendMessageExecutor = ThreadUtils.newThreadPoolExecutor(
-    this.brokerConfig.getSendMessageThreadPoolNums(),   // 默认 1
+    this.brokerConfig.getSendMessageThreadPoolNums(),   // 默认 min(CPU 核数, 4)，见 BrokerConfig.java:69
     this.brokerConfig.getSendMessageThreadPoolNums(),
     1000 * 60, TimeUnit.MILLISECONDS,
     this.sendThreadPoolQueue,                            // 有界队列，默认容量 10000
@@ -199,7 +199,7 @@ CONSUMER_SEND_MSG_BACK
 | 单条分发 | `SendMessageProcessor.sendMessage` | `SendMessageProcessor` |
 | 批量分发 | `SendMessageProcessor.sendBatchMessage` | `SendMessageProcessor` |
 
-注意：该 Processor 还处理 `CONSUMER_SEND_MSG_BACK`（code=15），消费重试消息复用同一入口但走完全不同的分支。
+注意：该 Processor 还处理 `CONSUMER_SEND_MSG_BACK`（code=36），消费重试消息复用同一入口但走完全不同的分支。
 
 ## 3. `preSend` 前置检查
 
@@ -288,8 +288,14 @@ CONSUMER_SEND_MSG_BACK
 - 成功：`ResponseCode.SUCCESS` + `SendMessageResponseHeader`
   （`msgId`=offsetMsgId 物理消息 id、`queueId`、`queueOffset`、事务相关的
   `transactionId`，以及静态 Topic 的逻辑 offset 回转）。
-- 失败：按状态映射错误码——磁盘满 `OS_PAGE_CACHE_BUSY`/`SYSTEM_ERROR`、
-  消息过大 `MESSAGE_ILLEGAL`、未知异常 `SYSTEM_ERROR` 等。
+- 特殊"成功"：`FLUSH_DISK_TIMEOUT` / `FLUSH_SLAVE_TIMEOUT` / `SLAVE_NOT_AVAILABLE`
+  按原码返回但 `sendOK=true`（计入发送成功统计）。
+- 失败：按状态映射错误码——磁盘满等不可写 `SERVICE_NOT_AVAILABLE`（remark 会说明
+  "the broker's disk is full"）、页缓存忙 `OS_PAGE_CACHE_BUSY` → `SYSTEM_BUSY`
+  （"[PC_SYNCHRONIZED]broker busy"，客户端会换 Broker 重试）、
+  消息过大 `MESSAGE_ILLEGAL`（含 `PROPERTIES_SIZE_EXCEEDED`）、
+  副本不足 `IN_SYNC_REPLICAS_NOT_ENOUGH` → `SYSTEM_ERROR`、
+  未知异常 `SYSTEM_ERROR` 等（见 `SendMessageProcessor.java:392-464`）。
 
 最后 `doResponse` 通过原 Channel 写回，opaque 匹配客户端挂起的 ResponseFuture。
 异步路径下这一步发生在 future 回调线程，Broker 发送线程早已释放。

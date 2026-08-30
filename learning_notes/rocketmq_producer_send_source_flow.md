@@ -198,9 +198,11 @@ SendResult result = producer.send(messages);
 
 同一批消息必须具有相同的 Topic 和 `waitStoreMsgOK`，不支持延时消息和 Retry Topic
 消息；编码后的整个批次还受 Producer `maxMessageSize` 限制，默认是 `4 MiB`。入口是
-[`MQProducer.send(Collection<Message>)`](../client/src/main/java/org/apache/rocketmq/client/producer/MQProducer.java)，
-约束由
+[`MQProducer.send(Collection<Message>)`](../client/src/main/java/org/apache/rocketmq/client/producer/MQProducer.java)。
+约束检查分两处：同 Topic/同 `waitStoreMsgOK`/禁延时与 Retry Topic 由
 [`MessageBatch.generateFromList`](../common/src/main/java/org/apache/rocketmq/common/message/MessageBatch.java)
+检查，而逐条与整批的大小限制由 `DefaultMQProducer.batch()` 及 `sendDefaultImpl`
+里的 [`Validators.checkMessage`](../common/src/main/java/org/apache/rocketmq/common/message/Validators.java)
 检查。
 
 需要类似 Kafka Producer 的透明攒批时，可以在 `start()` 前开启 autoBatch：
@@ -348,8 +350,10 @@ TOPIC_NOT_EXIST, SERVICE_NOT_AVAILABLE, SYSTEM_ERROR, SYSTEM_BUSY,
 NO_PERMISSION, NO_BUYER_ID, NOT_IN_CURRENT_UNIT, GO_AWAY
 ```
 
-如果某次已得到非 `SEND_OK` 的 `SendResult`，随后重试又没有取得更好结果，循环结束时
-仍可能返回这个 `SendResult`，而不是抛异常。业务代码不能只判断 `send()` 是否正常
+如果某次已得到非 `SEND_OK` 的 `SendResult`，且配置了
+`retryAnotherBrokerWhenNotStoreOK=true` 继续重试后仍未取得更好结果，循环结束时
+仍可能返回这个 `SendResult`，而不是抛异常（默认该开关为 false：同步发送收到
+非 `SEND_OK` 结果会立即返回，不再重试）。业务代码不能只判断 `send()` 是否正常
 返回，还要检查 `sendStatus`。
 
 ## 5. 共享内核：`sendKernelImpl`

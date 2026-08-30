@@ -178,7 +178,8 @@ topic + brokerName + queueId
 
 ## 重试时会切换 Broker 吗？
 
-**结论：不是固定的。同步发送重试时会切换 Broker，异步发送重试时默认在同一个 Broker 上重试。**
+**结论：不是固定的。同步与异步发送重试时都会优先切换到其他 Broker**
+（仅当 `topicPublishInfo` 拿不到时才回退原 Broker）。
 
 ### 同步发送（SYNC）— 会切换 Broker
 
@@ -210,7 +211,7 @@ return selectOneMessageQueue(); // 实在找不到才退回原逻辑
 同一个 Broker。此外 `MQFaultStrategy` 还会结合延迟故障规避（Broker 隔离），进一步避开有问题的
 Broker。
 
-### 异步发送（ASYNC）— 默认不换 Broker
+### 异步发送（ASYNC）— 同样优先换 Broker
 
 异步重试走的是 `MQClientAPIImpl.onExceptionImpl()`
 （`client/src/main/java/org/apache/rocketmq/client/impl/MQClientAPIImpl.java:719-730`）：
@@ -223,18 +224,19 @@ if (topicPublishInfo != null) {
 }
 ```
 
-注意这里调用 `selectOneMessageQueue(topicPublishInfo, brokerName, false)` 时 `resetIndex=false`。
-而 `MQFaultStrategy` 在非重试路径下不会应用 `lastBrokerName` 过滤（该过滤只在 `sendDefaultImpl`
-的主循环里配合 `resetIndex=true` 生效），所以异步重试**通常仍在原来的 Broker 上重试**——官方文档
-也明确说明：“异步重试不会选择其他broker，仅在同一个broker上做重试”
-（见 `docs/cn/features.md:60`）。
+注意：这里调用 `selectOneMessageQueue(topicPublishInfo, brokerName, false)` 时传入了
+当前失败的 `brokerName` 作为 `lastBrokerName`。`brokerFilter` 的生效条件只看
+`lastBrokerName` 是否为 null，与 `resetIndex` 无关（`resetIndex` 只控制是否重置轮询
+游标）。因此只要 `topicPublishInfo` 可用，异步重试就会**优先选一个其他 Broker 的
+队列**；代码注释里的 "by default, it will send to the same broker" 指的是
+`topicPublishInfo == null` 时的兜底行为。
 
 ### 汇总
 
 | 发送方式 | 重试是否换 Broker | 控制参数 |
 | --- | --- | --- |
 | 同步 SYNC | ✅ 优先换到其他 Broker | `retryTimesWhenSendFailed`（默认 2） |
-| 异步 ASYNC | ❌ 默认同一 Broker | `retryTimesWhenSendAsyncFailed`（默认 2） |
+| 异步 ASYNC | ✅ 优先换到其他 Broker（`topicPublishInfo == null` 时兜底原 Broker） | `retryTimesWhenSendAsyncFailed`（默认 2） |
 | ONEWAY | 无重试 | — |
 
 另外补充一点：即使换了 Broker，如果消息发送成功但返回的是 `FLUSH_DISK_TIMEOUT` /

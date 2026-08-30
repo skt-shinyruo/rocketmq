@@ -23,8 +23,8 @@ $storePath/index/{fileName}
 文件名使用创建时的时间戳。每个 IndexFile 固定大小，当前默认配置为：
 
 ```text
-hashSlotNum = 5,000,000
-indexNum    = 20,000,000
+hashSlotNum = 5,000,000              // maxHashSlotNum
+indexNum    = 20,000,000             // maxIndexNum，配置中定义为 maxHashSlotNum * 4
 ```
 
 单文件大小为：
@@ -33,7 +33,8 @@ indexNum    = 20,000,000
 40 + 5,000,000 * 4 + 20,000,000 * 20 = 420,000,040 bytes
 ```
 
-也就是约 400 MB。实现把索引下标 0 作为无效值，因此实际可用索引数约为 `indexNum - 1`。
+也就是约 400 MB。`maxIndexNum` 是固定值 2000 万，只调大 `maxHashSlotNum` 时它不会
+自动跟随。实现把索引下标 0 作为无效值，因此实际可用索引数约为 `indexNum - 1`。
 
 ## 3. 文件结构
 
@@ -69,14 +70,14 @@ IndexFile
 
 ```text
 ┌──────────────┬───────────────┬────────────┬────────────────┐
-│ Key Hash 4B  │ PhyOffset 8B  │ TimeDiff 4B│ PrevIndex 4B   │
+│ Key Hash 4B  │ PhyOffset 8B  │ TimeDiff 4B│ NextIndexPos 4B│
 └──────────────┴───────────────┴────────────┴────────────────┘
 ```
 
 - `Key Hash`：完整索引键的 Java `hashCode()`，转为非负值。
 - `PhyOffset`：消息在 CommitLog 中的物理偏移量。
 - `TimeDiff`：消息存储时间与本文件 `beginTimestamp` 的差值，单位为秒。
-- `PrevIndex`：同一哈希槽中上一条索引的下标。
+- `NextIndexPos`：同一哈希槽中上一条（更旧的）索引的下标；沿该字段从新到旧遍历链表。
 
 时间只保存差值，是为了节省空间；查询时用 `beginTimestamp + TimeDiff * 1000` 恢复毫秒时间戳。
 
@@ -130,24 +131,30 @@ topic#INDEX_TAG_TYPE#TAG
 
 1. 检查当前文件是否已达到 `indexNum`。
 2. 计算 `keyHash` 和 `slotPos`。
-3. 读取槽表中的旧头指针；非法值按空链处理。
-4. 在索引区追加一条 20 字节记录，`PrevIndex` 指向旧头。
+3. 读取槽表中的旧头指针；非法值（`slotValue <= invalidIndex || slotValue > indexCount`）
+   按空链归零处理。
+4. 在索引区追加一条 20 字节记录，`NextIndexPos` 字段指向旧头。
 5. 将槽表更新为当前索引下标。
-6. 更新 Header 的时间、物理偏移、槽计数和索引计数。
+6. 更新 Header 的时间、物理偏移和索引计数；其中 `hashSlotCount` 只在原来
+   槽为空（新占用一个槽）时递增，begin 字段只在首条索引时设置
+   （`IndexFile.java:152-162`）。
 
 伪代码如下：
 
 ```java
 int keyHash = indexKeyHashMethod(key);
 int slotPos = keyHash % hashSlotNum;
-int oldIndex = mappedByteBuffer.getInt(headerSize + slotPos * 4);
+int slotValue = mappedByteBuffer.getInt(headerSize + slotPos * 4);
+if (slotValue <= invalidIndex || slotValue > indexHeader.getIndexCount()) {
+    slotValue = invalidIndex;   // 空链或非法值归零
+}
 
 int newIndex = indexHeader.getIndexCount();
 int indexPos = headerSize + hashSlotNum * 4 + newIndex * 20;
 mappedByteBuffer.putInt(indexPos, keyHash);
 mappedByteBuffer.putLong(indexPos + 4, phyOffset);
 mappedByteBuffer.putInt(indexPos + 12, timeDiffSeconds);
-mappedByteBuffer.putInt(indexPos + 16, oldIndex);
+mappedByteBuffer.putInt(indexPos + 16, slotValue);   // 指向旧头
 mappedByteBuffer.putInt(headerSize + slotPos * 4, newIndex);
 ```
 
@@ -169,7 +176,7 @@ QueryMessageProcessor
 
 1. 拼出和写入时一致的索引键，例如 `topic#key`。
 2. 对索引键计算哈希并定位槽位。
-3. 从槽头开始沿 `PrevIndex` 遍历。
+3. 从槽头开始沿 `NextIndexPos` 字段向更旧的记录遍历。
 4. 用 `beginTimestamp + TimeDiff * 1000` 恢复消息时间。
 5. 同时满足哈希值和时间范围的记录加入物理偏移量列表。
 6. 达到 `maxNum` 或当前文件时间范围不可能命中时停止。
@@ -200,7 +207,7 @@ IndexFile       按 Key 建立查询索引
 ```text
 消息 Key
   -> hash slot
-  -> PrevIndex 链
+  -> NextIndexPos 链（从新到旧）
   -> CommitLog 物理偏移
   -> 读取消息正文
 ```

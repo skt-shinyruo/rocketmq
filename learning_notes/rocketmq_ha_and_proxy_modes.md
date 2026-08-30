@@ -54,7 +54,9 @@ Broker A (Master)  <->  Broker B/C (Slave)
 
 可以理解为：**数据仍由 Broker 复制，Controller 只负责决定谁当 Master。**
 
-DLedger 与 Controller 通常是两套不同的 Broker 高可用方案，不是叠加使用：
+DLedger 与 Controller 是两套不同的 Broker 高可用方案，**且互斥、不能叠加使用**：
+`BrokerStartup` 启动时检查到 `enableControllerMode` 与 `enableDLegerCommitLog`
+同时为 true 会直接退出（`System.exit(-4)`）：
 
 ```text
 DLedger：    Raft 直接管理数据复制和 Leader

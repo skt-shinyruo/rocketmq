@@ -71,7 +71,7 @@ flowchart LR
 
 补充说明：
 
-- queueOffset / physicalOffset 编码时先置 0，真正写入时在全局锁内由 `doAppend` 回填（`CommitLog.java:2037` 起）。
+- PHYSICALOFFSET 编码时先置 0（`MessageExtEncoder.java:234`，注释 "need update later"），真正写入时在全局锁内由 `doAppend` 回填（`CommitLog.java:2037` 起）；QUEUEOFFSET 编码时写入的已经是 `assignOffset` 分配好的真实队列偏移（`MessageExtEncoder.java:232`）。
 - 开启 `enabledAppendPropCRC` 时 properties 尾部预留 `CRC32_RESERVED_LEN` 字节（`CommitLog.java:86`），由 `doAppend` 在锁内计算整条消息的 CRC32 写入（`CommitLog.java:2053-2061`）。
 - 批量消息由 `encode(MessageExtBatch, ...)`（`MessageExtEncoder.java:282-383`）编码为多条完整布局消息的连续字节流，`doAppend` 批量版本（`CommitLog.java:2083-2178`）逐条回填。
 - 消息的 msgId 就是 `storeHost:port + physicalOffset` 拼出来的（`CommitLog.java:1990-1998`）——**所以 RocketMQ 的消息 ID 天然能直接定位到 CommitLog 中的物理位置**。
@@ -88,9 +88,9 @@ sequenceDiagram
     participant FM as FlushManager
     participant HA as HAService
 
-    T->>TQL: lock(topic-queue) 分配队列 offset
+    T->>TQL: lock(topic-queue)
+    T->>TQL: assignOffset 分配队列 offset<br/>+ 线程本地 encoder 编码（锁内）
     T->>TQL: unlock
-    T->>TQL: 线程本地 encoder 编码
     T->>PML: lock
     T->>MF: appendMessage → doAppend<br/>回填 queueOffset/physicalOffset/CRC
     alt 文件写满 (END_OF_FILE)
@@ -111,11 +111,11 @@ sequenceDiagram
 
 1. 设置 `storeTimestamp`、计算 `bodyCRC`；根据 topic 长度自动选 V1/V2 消息版本、判断 IPv6 设置 sysFlag（986-1001 行）。
 2. HA 前置检查：Controller 模式 / Slave Acting Master 下校验 inSyncReplicas 是否足够（1017-1036 行）。
-3. `topicQueueLock`（细粒度锁，`CommitLog.java:1038`）内执行 `assignOffset` 分配逻辑队列偏移，然后用 `putMessageThreadLocal` 线程本地 encoder 编码（1050 行，避免编码争锁）。
+3. `topicQueueLock`（细粒度锁，`CommitLog.java:1038`）**持锁期间**执行 `assignOffset` 分配逻辑队列偏移（1047 行），随后在同一把锁内用 `putMessageThreadLocal` 线程本地 encoder 编码（1050 行，避免编码争锁），`finally` 中才 `topicQueueLock.unlock`（1122 行）。
 4. `putMessageLock`（1057 行）全局写锁内 append——锁实现三选一（`CommitLog.java:142-145`）：`AdaptiveBackOffSpinLockImpl` / `PutMessageReentrantLock`（默认，`MessageStoreConfig.java:167`）/ `PutMessageSpinLock`。**这是全局写入串行点，也是单 Broker 吞吐的上限所在**。
-5. 锁内 `mappedFile.appendMessage(...)`（1079 行）→ `appendMessagesInner()`（`DefaultMappedFile.java:351-420`）取 `writeBuffer != null ? writeBuffer : mappedByteBuffer` 的 slice，position=wrotePosition，调 `DefaultAppendMessageCallback.doAppend()` 回填后 `byteBuffer.put(preEncodeBuffer)`，CAS 更新 `wrotePosition`。
+5. 锁内 `mappedFile.appendMessage(...)`（1079 行）→ `appendMessagesInner()`（`DefaultMappedFile.java:351-420`）取 `writeBuffer != null ? writeBuffer : mappedByteBuffer` 的 slice，position=wrotePosition，调 `DefaultAppendMessageCallback.doAppend()` 回填后 `byteBuffer.put(preEncodeBuffer)`，用 `WROTE_POSITION_UPDATER.addAndGet(...)` 原子累加 `wrotePosition`（`DefaultMappedFile.java:416`）。
 6. `END_OF_FILE` 时写 BLANK、`getLastMappedFile(0)` 建新文件重写（1084-1101 行）；成功后 `increaseOffset`（1117 行）。
-7. 解锁后进入 `handleDiskFlushAndHA()`（1130-1349 行）：`handleDiskFlush` 与 `handleHA` 两个 future `thenCombine`。
+7. 解锁后进入 `handleDiskFlushAndHA()`（实现在 1330-1349 行，调用点 1139 行）：`handleDiskFlush` 与 `handleHA` 两个 future `thenCombine`。
 
 ### 3.4 刷盘：四种组合
 
@@ -142,7 +142,7 @@ sequenceDiagram
 
 ### 4.1 物理组织与 20 字节条目
 
-在用的是 store 根目录下的 `ConsumeQueue.java`（`CQType.SimpleCQ`，1108-1110 行）；实例化入口 `queue/ConsumeQueueStore.java:244-252`，按 `CQType` 分为 `SimpleCQ` / `BatchCQ`（`CQType` 枚举在 `common/.../attribute/CQType.java:21-23`）。
+在用的是 store 根目录下的 `ConsumeQueue.java`（`CQType.SimpleCQ`，1108-1110 行）；实例化入口 `queue/ConsumeQueueStore.java:244-252`，按 `CQType` 分为 `SimpleCQ` / `BatchCQ` / `RocksDBCQ` 三种（`CQType` 枚举在 `common/.../attribute/CQType.java:21-23`）。
 
 条目格式（`ConsumeQueue.java:52-64` 注释）：
 
@@ -184,7 +184,7 @@ flowchart LR
 - **注册分发器**：`DefaultMessageStore` 构造函数 248-249 行注册 `CommitLogDispatcherBuildConsumeQueue` 和 `CommitLogDispatcherBuildIndex`（另有 `CommitLogDispatcherBuildTransIndex`，2270 行，RocksDB 事务索引）。
 - **ReputMessageService**（`DefaultMessageStore.java:2655-2843`）：`run()` 循环每 1ms 调一次 `doReput()`（2823-2829 行）；`isCommitLogAvailable()`（2703-2705 行）= `reputFromOffset < getReputEndOffset()`（默认为 `commitLog.getConfirmOffset()`）。
 - **doReput**（2711-2789 行）：`commitLog.getData(reputFromOffset)`（2723 行）→ `checkMessageAndReturnSize()` 解出 `DispatchRequest`（2733-2734 行）→ `doDispatch`（2745 行）→ `reputFromOffset += size`；`size == 0` 时 `rollNextFile` 跳到下一个 CommitLog 文件（2762 行）。
-- **启动时机**：正常启动在 442-443 行（reputFromOffset 初始化为 confirmOffset）；崩溃恢复启动在 502 行，从 `maxPhysicalPosInLogicQueue`（CQ 已 dispatched 的最大物理位点）继续，513 行会同步追平积压。
+- **启动时机**：`start()`（442 行）统一把 `reputFromOffset` 初始化为 `confirmOffset` 再启动（`DefaultMessageStore.java:442-443`），正常启动与崩溃恢复启动行为一致。之后会调用 `doRecheckReputOffsetFromCq()`（502/513 行所在的"按 CQ 已 dispatch 位点校验 reput 起点"逻辑），但该方法开头就检查 `recheckReputOffsetFromCq`（默认 false，`MessageStoreConfig.java:305`），**默认配置下不会执行**，主要用于 DLedger/自动主从切换场景校验 dispatch 一致性。
 - **长轮询唤醒**：dispatch 后若开启 long polling，2644-2652 行 `notifyMessageArriveIfNecessary()` 通知挂起的拉取请求。
 - **DispatchRequest 字段**（`DispatchRequest.java:24-49`）：`topic, queueId, commitLogOffset, msgSize, tagsCode, storeTimestamp, consumeQueueOffset, keys, success, uniqKey, sysFlag, preparedTransactionOffset, propertiesMap, bitMap` 及 batch 用的 `msgBaseOffset/batchSize`。
 
@@ -199,11 +199,11 @@ flowchart LR
 
 详细分析另见 [rocketmq_indexfile.md](rocketmq_indexfile.md)，此处摘要：
 
-- **布局**：`40B IndexHeader + 500万槽 × 4B + 2000万条目 × 20B ≈ 400MB`（`IndexFile.java:54-58`；`maxHashSlotNum = 5000000`、`maxIndexNum = 20000000`，`MessageStoreConfig.java:228-229`）。
+- **布局**：`40B IndexHeader + 500万槽 × 4B + 2000万条目 × 20B ≈ 400MB`（`IndexFile.java:54-58`；`maxHashSlotNum = 5000000`、`maxIndexNum = 5000000 * 4`，`MessageStoreConfig.java:228-229`）。
 - **IndexHeader 40B**（`IndexHeader.java:24-43`）：beginTimestamp/endTimestamp/beginPhyOffset/endPhyOffset/hashSlotCount/indexCount；indexCount 初始值为 1（0 保留为"无效索引"标记，`IndexFile.java:46`）。
-- **条目 20B**：`keyHash(4B) + phyOffset(8B) + timeDiff(4B，相对 beginTimestamp 的秒差) + prevIndex(4B)`。
+- **条目 20B**：`keyHash(4B) + phyOffset(8B) + timeDiff(4B，相对 beginTimestamp 的秒差) + nextIndexPos(4B)`，`nextIndexPos` 保存同槽中上一条（更旧）记录的下标，查询时沿它从新到旧遍历。
 - **冲突解决**：头插法单向链表——槽存最新条目序号，新条目的 prevIndex 指向旧条目；查询沿链回溯（`selectPhyOffset`，`IndexFile.java:216-251`），靠 `keyHashRead == keyHash` 过滤假冲突，靠 `timeRead < begin` 提前剪枝。
-- **key 构造**（`IndexService.buildKey()`，217-222 行）：`topic#key`；每条消息最多建 3 类索引——uniqKey、业务 keys、tag（`buildIndex`，224-282 行）。
+- **key 构造**（`IndexService.buildKey()`，217-222 行）：uniqKey 与业务 keys 为 `topic#key`，tag 索引为三段式 `topic#T#tag`（`INDEX_TAG_TYPE = "T"`）；每条消息最多建 3 类索引——uniqKey、业务 keys、tag（`buildIndex`，224-282 行）。
 - **查询**（`IndexService.queryOffset()`，169-215 行）：从最新文件向最旧遍历，文件级时间区间粗过滤 + 条目级时间细过滤，返回 CommitLog 物理偏移列表。
 - **创建/删除**：最后一个文件写满才创建新文件，文件名是时间戳人类可读格式（`IndexService.java:353-355`）；删除跟着 CommitLog 走——`endPhyOffset < commitLog.minOffset` 的文件连带删除，但永远保留最新一个（`IndexService.java:110-131`）。
 
@@ -211,7 +211,7 @@ flowchart LR
 
 ### 6.1 过期删除
 
-- **CleanCommitLogService**（`DefaultMessageStore.java:2301-2573`）：每 10s（`cleanResourceInterval`）检查。触发条件三选一：到达 `deleteWhen`（默认凌晨 4 点）、磁盘超阈值（`diskMaxUsedSpaceRatio = 75%`，超 90% 标记磁盘满拒写）、手动删除。删除依据是**文件最大时间戳超过 `fileReservedTime`（默认 72 小时，`MessageStoreConfig.java:188`）**。
+- **CleanCommitLogService**（`DefaultMessageStore.java:2301-2573`）：每 10s（`cleanResourceInterval`）检查。触发条件三选一：到达 `deleteWhen`（默认凌晨 4 点）、磁盘超阈值（`diskSpaceWarningLevelRatio` 默认 90%，超过即标记磁盘满拒写；另有 `diskSpaceCleanForciblyRatio` 默认 85% 触发强制清理；`diskMaxUsedSpaceRatio = 75%` 只在多路径按磁盘分区分组场景参与清理判断）、手动删除。删除依据是**文件最大时间戳超过 `fileReservedTime`（默认 72 小时，`MessageStoreConfig.java:188`）**。
 - **CleanConsumeQueueService**（`queue/ConsumeQueueStore.java:867-907`）：CQ 不按时间删除，而是**跟着 CommitLog 走**——`commitLog.getMinOffset()` 前进后，删除各 CQ 中 maxPhysicOffset 落后的文件，并同步删除过期 index 文件（897-900 行）。这是"CQ 只是视图"的直接体现。
 
 ### 6.2 启动恢复流程
@@ -241,7 +241,7 @@ flowchart TD
 
 ## 七、5.x 的演进
 
-- `StoreType`（`StoreType.java:25-27`）支持 `default` 与 `defaultRocksDB`：后者（`RocksDBMessageStore` 继承 `DefaultMessageStore`，仅覆写 `createConsumeQueueStore()`）把 ConsumeQueue 换成 RocksDB KV 实现，解决海量队列场景下 CQ 文件数过多的问题；**CommitLog 本身仍是 mmap 文件**。
+- `StoreType`（`StoreType.java:25-27`）支持 `default` 与 `defaultRocksDB`：后者（`RocksDBMessageStore` 继承 `DefaultMessageStore`，覆写 `createConsumeQueueStore()` 和 `isNotifyMessageArriveWhenReput()`——后者返回 false，因为 RocksDB CQ 由 `RocksGroupCommitService` 异步提交，reput 时不再立即通知消费者）把 ConsumeQueue 换成 RocksDB KV 实现，解决海量队列场景下 CQ 文件数过多的问题；**CommitLog 本身仍是 mmap 文件**。
 - `tieredstore` 模块以插件形式（`TieredMessageStore`）把本地盘冷数据卸载到对象存储等廉价介质，以低成本延长消息保留时间。
 
 ## 八、总结

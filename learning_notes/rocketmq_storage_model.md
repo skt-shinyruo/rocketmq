@@ -59,13 +59,18 @@ RocketMQ 存储架构分为四大子系统，各组件间的数据流关系如�
 ```
 Producer ──Send Message──→ CommitLog ──异步分发──→ ReputMessageService
                                                     │
-                    ┌───────────────────────────────┼───────────────────────────────┐
-                    ↓                               ↓                               ↓
-              ConsumeQueue                     IndexFile                     TimerLog
-                    │                               │                               │
-                    ↓                               ↓                               ↓
-              Consumer                        Query API                    Delay Consumer
-                                           (按Key查询)                     (延时消费)
+                              ┌─────────────────────┴─────────────────────┐
+                              ↓                                           ↓
+                        ConsumeQueue                                IndexFile
+                              │                                           │
+                              ↓                                           ↓
+                        Consumer                                    Query API
+                                                              (按Key查询)
+
+延时消息链路（独立于 reput 分发）：
+Producer ──Send Message──→ CommitLog(rmq_sys_wheel_timer)
+                              └──→ TimerMessageStore.TimerEnqueueGetService
+                                     └──→ TimerLog/TimerWheel ──到期改写──→ Delay Consumer
 ```
 
 **组件依赖关系**：
@@ -81,12 +86,15 @@ CommitLog ──依赖──→ MappedFile ──借用──→ TransientStoreP
   │
   ├──持久化──→ StoreCheckpoint (检查点)
   │
-  └──清理──→ CleanCommitLogService ──清理──→ ConsumeQueue
+  └──清理──→ CleanCommitLogService（只清 CommitLog）
+                ConsumeQueue/IndexFile/TimerLog 由 CleanConsumeQueueService /
+                CleanIndexService / CleanTimerLogService 各自清理
+                （ConsumeQueue 清理会连带删除其归属的 IndexFile）
 ```
 
 **子系统划分**：
 - **存储核心**：CommitLog（消息主体）、ConsumeQueue（消费索引）、IndexFile（Key索引）、TimerLog（延时消息）
-- **服务线程**：ReputMessageService（异步分发）、FlushManager（刷盘）、AllocateMappedFileService（预分配）、CleanCommitLogService（清理）
+- **服务线程**：ReputMessageService（异步分发）、FlushManager（刷盘）、AllocateMappedFileService（预分配）、CleanCommitLogService/CleanConsumeQueueService/CleanIndexService（清理）
 - **存储优化**：TransientStorePool（堆外内存）、MappedFile（内存映射）
 - **高可用与恢复**：HAService（主从同步）、StoreCheckpoint（故障恢复）
 
@@ -254,7 +262,7 @@ consumequeue/
 - **定长设计**：每条 20 bytes，支持数组式随机访问，`offset = queueOffset * 20`
 - **文件大小**：每个文件包含 30 万条记录，约 5.72MB（`300000 * 20 = 6,000,000 bytes`）
 - **顺序读取**：消费时顺序遍历，配合 PageCache 预读，性能接近内存
-- **Tag 过滤**：Consumer 先比较 Tag Hash，不匹配则跳过，避免无效的 CommitLog 读取
+- **Tag 过滤**：Broker 在 `getMessage` 时先按索引条目中的 Tag Hash（tagsCode）预过滤，不匹配的消息不会返回给 Consumer，避免无效的 CommitLog 读取；Consumer 收到消息后再做 Tag 字符串的最终精确校验
 
 **ConsumeQueueExt**（扩展索引）：
 
@@ -268,10 +276,12 @@ public static final int CQ_STORE_UNIT_SIZE = 20;
 public SelectMappedBufferResult getIndexBuffer(final long startIndex) {
     int mappedFileSize = this.mappedFileSize;
     long offset = startIndex * CQ_STORE_UNIT_SIZE;
-    MappedFile mappedFile = this.mappedFileQueue.findMappedFileByOffset(offset);
-    if (mappedFile != null) {
-        int pos = (int) (offset % mappedFileSize);
-        return mappedFile.selectMappedBuffer(pos, CQ_STORE_UNIT_SIZE);
+    if (offset >= this.getMinLogicOffset()) {
+        MappedFile mappedFile = this.mappedFileQueue.findMappedFileByOffset(offset);
+        if (mappedFile != null) {
+            int pos = (int) (offset % mappedFileSize);
+            return mappedFile.selectMappedBuffer(pos, CQ_STORE_UNIT_SIZE);
+        }
     }
     return null;
 }
@@ -371,7 +381,7 @@ public boolean putKey(final String key, final long phyOffset, final long storeTi
 
 ### 2.4 TimerLog（延时消息存储）
 
-**设计原理**：TimerLog 是 RocketMQ 5.x 引入的延时消息存储，采用时间轮（TimerWheel）机制实现高效的延时消息管理。延时消息先存储在 TimerLog 文件中，TimerWheel 按时间槽管理消息的触发时机。
+**设计原理**：TimerLog 是 RocketMQ 延时消息的存储（`timerWheelEnable` 默认 true），采用时间轮（TimerWheel）机制实现高效的延时消息管理。延时消息先存储在 TimerLog 文件中，TimerWheel 按时间槽管理消息的触发时机。
 
 **存储路径**：`$storePath/timerlog/`
 
@@ -401,7 +411,7 @@ public boolean putKey(final String key, final long phyOffset, final long storeTi
 | **Prev Position** | 8 bytes | 前一个单元位置（链表结构） |
 | **Magic Value** | 4 bytes | 魔数，用于校验 |
 | **Write Time** | 8 bytes | 写入时间戳，用于追踪 |
-| **Delayed Time** | 4 bytes | 延迟时间 |
+| **Delayed Time** | 4 bytes | 延迟时间（与写入时间的差值，单位毫秒，见 `TimerMessageStore` 写入 `(int)(delayedTime - tmpWriteTimeMs)`） |
 | **CommitLog Offset** | 8 bytes | 对应的 CommitLog 物理偏移量 |
 | **Message Size** | 4 bytes | 消息大小 |
 | **Topic Hash** | 4 bytes | 真实 Topic 的哈希值 |
@@ -481,7 +491,7 @@ public static final short SIZE = 32; // Slot 大小
 
 ### 3.1 ReputMessageService
 
-**核心职责**：Broker 后台服务线程，异步构建 ConsumeQueue、IndexFile 和 TimerLog。
+**核心职责**：Broker 后台服务线程，异步构建 ConsumeQueue 和 IndexFile（以及 Compaction 分发）。注意：**TimerLog 索引不经过 reput 分发链**——延时消息先由 Producer 端改写落入系统 Topic `rmq_sys_wheel_timer`，由 `TimerMessageStore` 自己的 `TimerEnqueueGetService` 从该 Topic 的 ConsumeQueue 读取后经 `enqueue()` 写入 TimerLog/TimerWheel。
 
 **工作流程**：
 
@@ -491,10 +501,12 @@ CommitLog ──新消息写入──→ ReputService ──触发 reput──�
                                                               ↓
                                                     解析消息元数据(Topic/QueueId/Tag/Key)
                                                               │
-                    ┌─────────────────────────────────────────┼─────────────────────────────────────────┐
-                    ↓                                         ↓                                         ↓
-              ConsumeQueue                              IndexService                           TimerService
-              (写入索引条目)                             (写入 Key 索引)                        (写入延时消息索引)
+                              ┌───────────────────────────────┼───────────────────────────────┐
+                              ↓                               ↓
+                        ConsumeQueue                    IndexService
+                        (写入索引条目)                   (写入 Key 索引)
+
+（延时消息不走此链路：rmq_sys_wheel_timer → TimerEnqueueGetService → TimerLog/TimerWheel）
 ```
 
 **处理流程**：
@@ -503,7 +515,8 @@ CommitLog ──新消息写入──→ ReputService ──触发 reput──�
 2. 解析消息的 Topic、QueueId、Tag、Key 等元数据
 3. 将消息索引写入对应的 ConsumeQueue 文件
 4. 若消息有 Key，则构建 IndexFile 索引
-5. 若消息是延时消息，则构建 TimerLog 索引
+5. 若启用了 Compaction（默认 `enableCompaction=true`），分发对应消息
+6. 延时消息（定时消息）不在此链路构建 TimerLog 索引：其索引由 `TimerMessageStore.TimerEnqueueGetService` 独立构建
 
 **并发构建**：
 
@@ -520,7 +533,7 @@ ReputService ──→ CommitLogDispatcherBuildConsumeQueue ──→ CommitLogD
                                                               ↓
                                                     CommitLogDispatcherBuildTransIndex
                                                               │
-                                                              ↓ (仅 enableCompaction=true 时启用)
+                                                              ↓（仅 enableCompaction=true 时注册，默认 true）
                                                     CommitLogDispatcherCompaction
 ```
 
@@ -530,8 +543,8 @@ ReputService ──→ CommitLogDispatcherBuildConsumeQueue ──→ CommitLogD
 |-----------|------|------------|
 | **CommitLogDispatcherBuildConsumeQueue** | 构建 ConsumeQueue 索引 | 是 |
 | **CommitLogDispatcherBuildIndex** | 构建 IndexFile 索引 | 是 |
-| **CommitLogDispatcherBuildTransIndex** | 构建事务消息索引 | 是 |
-| **CommitLogDispatcherCompaction** | 构建压缩索引 | 仅 `enableCompaction=true` 时启用 |
+| **CommitLogDispatcherBuildTransIndex** | 构建事务消息索引 | 默认注册，但仅 `transRocksDBEnable=true`（默认 false）时实际生效 |
+| **CommitLogDispatcherCompaction** | Compaction 分发 | `enableCompaction=true`（默认 true）时注册 |
 
 **核心代码**（[DefaultMessageStore.java](file:///home/feng/code/opensource/rocketmq/store/src/main/java/org/apache/rocketmq/store/DefaultMessageStore.java)）：
 
@@ -755,7 +768,7 @@ public ByteBuffer borrowBuffer() {
 
 **核心职责**：存储恢复检查点信息，支持 Broker 故障重启后的状态恢复。
 
-**检查点文件结构**（48 bytes）：
+**检查点文件结构**（6 个字段共 48 bytes 有效数据；文件本体按 4KB 页大小映射创建，实际占用为一个页）：
 
 | 偏移 | 大小 | 字段 | 说明 |
 |-----|------|-----|------|
@@ -808,8 +821,8 @@ public void flush() {
 
 步骤11: ReputService 异步构建索引（后台）
         ├─ ConsumeQueue 索引
-        ├─ IndexFile 索引（有 Key 时）
-        └─ TimerLog 索引（延时消息时）
+        └─ IndexFile 索引（有 Key 时）
+        （延时消息的 TimerLog 索引由 TimerMessageStore 独立构建，不走 reput 链路）
 ```
 
 ### 4.2 写入核心步骤
@@ -871,10 +884,11 @@ AppendMessageResult result = mappedFile.appendMessage(msg, appendMessageCallback
 步骤1: Consumer ──Pull Message(topic, queueId, offset)──→ Broker
 步骤2: Broker ──读取索引条目(CommitLog Offset + Size + Tag Hash)──→ ConsumeQueue
 步骤3: ConsumeQueue ──返回索引数据──→ Broker
+步骤3.5: Broker ──按 Tag Hash 预过滤（MessageFilter 比较索引条目 tagsCode，不匹配则跳过）──→ CommitLog
 步骤4: Broker ──根据物理偏移量读取消息──→ CommitLog
 步骤5: CommitLog ──返回完整消息──→ Broker
 步骤6: Broker ──Return Message──→ Consumer
-步骤7: Consumer ──校验 Tag Hash（若不匹配则丢弃）──→ 业务处理
+步骤7: Consumer ──按 Tag 字符串精确校验（不匹配则丢弃）──→ 业务处理
 ```
 
 ### 5.2 Key 查询流程
@@ -994,15 +1008,19 @@ RocketMQ 4.5+ 支持 DLedger 模式，基于 Raft 协议实现多副本数据一
 
 **核心代码**（[HAService.java](file:///home/feng/code/opensource/rocketmq/store/src/main/java/org/apache/rocketmq/store/ha/HAService.java)）：
 
-```java
-class HAClient {
-    // 从 Master 拉取 CommitLog 数据
-    // 写入本地 CommitLog
-}
+`HAService`/`HAClient`/`HAConnection` 均为接口，默认实现为 `DefaultHAService`/`DefaultHAClient`/`DefaultHAConnection`（Controller 模式下由 `AutoSwitchHAService` 提供自动主从切换）：
 
-class HAConnection {
-    // Master 端维护的连接，推送数据给 Slave
+```java
+// 接口定义（ha/HAService.java）
+public interface HAService {
+    interface HAClient {
+        // Slave 端：从 Master 拉取 CommitLog 数据并写入本地 CommitLog
+    }
+    interface HAConnection {
+        // Master 端维护的连接，推送数据给 Slave
+    }
 }
+// 默认实现：ha/DefaultHAService.java、ha/DefaultHAClient.java、ha/DefaultHAConnection.java
 ```
 
 ### 6.3 数据完整性保障
@@ -1132,7 +1150,7 @@ RocketMQ 5.x 支持 RocksDB 作为存储引擎，提供更灵活的存储方案�
 | **ConsumeQueue** | 定长索引文件 | 支持（RocksDBConsumeQueue） |
 | **Index** | Hash 索引文件 | 支持（IndexRocksDBStore） |
 | **Timer** | 时间轮文件 | 支持（TimerMessageRocksDBStore） |
-| **Transaction** | 事务表文件 | 支持（TransMessageRocksDBStore） |
+| **Transaction** | 系统 Topic（RMQ_SYS_TRANS_HALF_TOPIC） | 支持（TransMessageRocksDBStore） |
 
 **配置参数**：
 
@@ -1153,16 +1171,17 @@ RocketMQ 5.x 支持 RocksDB 作为存储引擎，提供更灵活的存储方案�
 Broker 启动
     │
     ↓
-检查 abort 文件
+检查 abort 文件（决定走哪条恢复分支，两种情况都会执行 recover()，
+见 DefaultMessageStore.load() 中的 recover(lastExitOK) 调用）
     │
-    ├── 存在 ──→ 异常关闭，执行恢复流程
+    ├── 存在 ──→ 异常关闭（lastExitOK=false），recoverAbnormally()
     │               │
     │               ├─ 步骤1: 加载 CommitLog
     │               ├─ 步骤2: 校验魔数和 CRC
     │               ├─ 步骤3: 修复损坏消息
     │               └─ 步骤4: 继续以下流程
     │
-    └── 不存在 ──→ 正常关闭，跳过恢复
+    └── 不存在 ──→ 正常关闭（lastExitOK=true），recoverNormally()
                     │
                     ↓
 步骤5: 加载 ConsumeQueue
@@ -1174,8 +1193,9 @@ Broker 启动
 步骤11: 启动完成
 
 恢复策略：
-- 正常关闭：索引文件完整，直接加载使用
-- 异常关闭：可能存在索引不一致，需要根据 CommitLog 重建索引
+- 正常关闭：从 checkpoint 位点做较轻量的校验与推进（recoverNormally），
+  仍会校验 CommitLog 尾部并推进 dispatch 位点，并非"完全跳过恢复"
+- 异常关闭：可能存在索引不一致，需要根据 CommitLog 重建索引（recoverAbnormally）
 ```
 
 ### 8.2 恢复核心逻辑
@@ -1358,7 +1378,10 @@ Producer 配置位于
 | `compressMsgBodyOverHowmuch` | `4096` bytes | 原始 body 大小大于等于该值时尝试压缩 |
 | `compressType` | `ZLIB` | 支持 LZ4、ZSTD、ZLIB |
 | `compressLevel` | `5` | 传给所选 compressor；LZ4 当前不使用该参数 |
-| `decodeDecompressBody` | `true` | Consumer 是否在解码时自动解压 |
+
+`decodeDecompressBody` 属于消费端配置，定义在
+[`ClientConfig`](../client/src/main/java/org/apache/rocketmq/client/ClientConfig.java)
+（系统属性 `com.rocketmq.decompress.body`）：
 
 `compressType` 和 `compressLevel` 也可分别通过 JVM 属性
 `rocketmq.message.compressType`、`rocketmq.message.compressLevel` 设置；Consumer 自动解压
@@ -1424,10 +1447,12 @@ RocketMQ 事务消息采用两阶段提交（2PC）模式：
 半消息通过 `SysFlag` 中的 `TRANSACTION_PREPARED_TYPE` 标志区分：
 
 ```java
-public final static int TRANSACTION_PREPARED_TYPE = 0x01 << 4;
-public final static int TRANSACTION_COMMIT_TYPE = 0x02 << 4;
-public final static int TRANSACTION_ROLLBACK_TYPE = 0x03 << 4;
-public final static int TRANSACTION_NOT_TYPE = 0x00 << 4;
+public final static int TRANSACTION_NOT_TYPE = 0;
+public final static int TRANSACTION_PREPARED_TYPE = 0x1 << 2;
+public final static int TRANSACTION_COMMIT_TYPE = 0x2 << 2;
+public final static int TRANSACTION_ROLLBACK_TYPE = 0x3 << 2;
+// 注意：占用 bit2-bit3。bit0 是 COMPRESSED_FLAG，bit1 是 MULTI_TAGS_FLAG，
+// bit4-5 是 BORNHOST_V6_FLAG/STOREHOSTADDRESS_V6_FLAG，bit8-10 是压缩算法位
 ```
 
 **事务消息存储机制**：
@@ -1482,7 +1507,7 @@ class CommitLogDispatcherBuildTransIndex implements CommitLogDispatcher {
 **TransactionalMessageCheckService**：
 
 ```
-定时任务（默认 1 分钟）
+定时任务（`transactionCheckInterval`，默认 30 秒）
     │
     ↓
 扫描超时半消息（默认超时时间 6 秒）
@@ -1510,20 +1535,24 @@ class CommitLogDispatcherBuildTransIndex implements CommitLogDispatcher {
 
 **设计原理**：Tag 过滤是 RocketMQ 最核心的过滤机制，基于 Tag 的哈希值实现快速过滤。
 
-**过滤流程**：
+**过滤流程**（主过滤在 Broker 端完成，Consumer 只做最终精确校验）：
 
 ```
 Consumer 订阅时指定 Tag
     │
     ↓
-Pull 消息时获取 ConsumeQueue 索引条目
+Broker 拉取消息时读取 ConsumeQueue 索引条目（getMessage 内由
+MessageFilter/DefaultMessageFilter 执行）
     │
     ↓
-比较索引条目中的 Tag HashCode
+比较索引条目中的 Tag HashCode（tagsCode）
     │
-    ├── 匹配 ──→ 读取 CommitLog 中的完整消息
+    ├── 匹配 ──→ 读取 CommitLog 中的完整消息并返回
     │
-    └── 不匹配 ──→ 跳过，继续读取下一条
+    └── 不匹配 ──→ 跳过，消息根本不会返回给 Consumer
+    │
+    ↓
+Consumer 收到消息后按 Tag 字符串精确校验（Hash 可能碰撞），不匹配则丢弃
 ```
 
 **Tag Hash 计算**（[MessageExtBrokerInner.java](file:///home/feng/code/opensource/rocketmq/common/src/main/java/org/apache/rocketmq/common/message/MessageExtBrokerInner.java)）：
@@ -1617,7 +1646,7 @@ Pull 消息时先读取 ConsumeQueue 索引
 | **消息过滤** | Tag + SQL92 | 支持更复杂的过滤表达式 |
 | **事务消息** | 基础 2PC | 增强事务回查机制 |
 | **存储优化** | 基础冷热分离 | 多级冷热分离 + 压缩优化 |
-| **一致性协议** | Master/Slave | 支持 DLedger Raft |
+| **一致性协议** | Master/Slave（4.5 起支持 DLedger Raft） | 延续 DLedger，新增 Controller 自动主从切换 |
 
 ### 13.2 延时消息差异
 
@@ -1653,7 +1682,7 @@ Pull 消息时先读取 ConsumeQueue 索引
 | ConsumeQueue | 定长索引文件 | 支持 |
 | IndexFile | Hash 索引文件 | 支持 |
 | TimerLog | 时间轮文件 | 支持 |
-| Transaction | 事务表文件 | 支持 |
+| Transaction | 系统 Topic（RMQ_SYS_TRANS_HALF_TOPIC） | 支持 |
 
 ---
 

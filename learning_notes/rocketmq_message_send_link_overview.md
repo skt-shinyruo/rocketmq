@@ -112,7 +112,7 @@ if (this.tryToCompressMessage(msg)) { ... }    // body >= 4KB 时压缩
 if (sendSmartMsg || msg instanceof MessageBatch) {
     request = RemotingCommand.createRequestCommand(
         msg instanceof MessageBatch ? RequestCode.SEND_BATCH_MESSAGE : RequestCode.SEND_MESSAGE_V2,
-        requestHeaderV2);   // V2 用字段索引代替字符串 key,减小包体
+        requestHeaderV2);   // V2 把字段名压缩成 a、b、c 等单字符短名,减小包体
 }
 request.setBody(msg.getBody());
 ```
@@ -121,7 +121,7 @@ request.setBody(msg.getBody());
 
 | 模式 | 实现 | 特点 |
 |------|------|------|
-| SYNC | `invokeSync` + 倒计时锁等待响应 | 失败可内部重试 |
+| SYNC | `invokeSync` + 倒计时锁等待响应 | 同步等待；重试发生在更上层的 `sendDefaultImpl` 外层循环（remoting 层本身不重试） |
 | ASYNC | `invokeAsync` + `InvokeCallback` | 传输异常或响应解析为异常时由 `onExceptionImpl` 重试（`retryTimesWhenSendAsyncFailed`）；收到非 `SEND_OK` 的正常响应会回调成功并携带该状态 |
 | ONEWAY | `invokeOneway`,不等待响应 | 无重试、无结果 |
 

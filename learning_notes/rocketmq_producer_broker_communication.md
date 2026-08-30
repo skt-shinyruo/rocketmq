@@ -45,7 +45,7 @@ sequenceDiagram
 
 - 请求体：`SendMessageRequestHeader`（topic、queueId、sysFlag、bornTimestamp、UNIQ_KEY 等）+ 消息 body；批量消息走 `SEND_BATCH_MESSAGE`(320)/V2。
 - 响应：`SendResult`（含 `msgId`——客户端生成的 UNIQ_KEY，以及 `offsetMsgId`——Broker 生成的物理 offset id、`queueOffset`——CommitLog 分配的队列偏移）。
-- 重试边界：SYNC 默认最多重试 3 次（每次重新选队列，可能换 Broker）；ASYNC 在 remoting 层失败时也可换 Broker 重试；ONEWAY 无任何重试与结果。
+- 重试边界：SYNC 默认重试 2 次、共尝试 3 次（`retryTimesWhenSendFailed=2`，每次重新选队列，可能换 Broker）；ASYNC 在 remoting 层失败时也可换 Broker 重试（`retryTimesWhenSendAsyncFailed=2`）；ONEWAY 无任何重试与结果。
 
 ## 3. 特殊场景附加通信
 

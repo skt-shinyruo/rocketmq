@@ -193,7 +193,9 @@ NameServer 设计成：
 - **无状态**：内存里只有一份从各 Broker 心跳汇总来的路由表；
 - **彼此完全不通信**：多台 NameServer 之间不同步数据，每台各自独立服务；
 - **不做任何决策**：Broker 每 30 秒上报"我这台机器上有 topic-X 的队列 0、1、2"，
-  NameServer 照单记录；14 秒收不到某 Broker 心跳，就把它整台摘除。
+  NameServer 照单记录；默认 120 秒收不到某 Broker 心跳，就把它整台摘除
+  （`DEFAULT_BROKER_CHANNEL_EXPIRED_TIME`；仅当 Broker 开启 `enableSlaveActingMaster`
+  时才随注册上报更短的 `brokerNotActiveTimeoutMillis`，默认 10 秒）。
 
 这意味着：**"队列归谁"这个事实，是由持有它的 Broker 自己声明的，
 没有任何第三方校验。**
@@ -278,8 +280,10 @@ RocketMQ 的 Broker 并不孤立——有 Master/Slave 主从复制，
 关键点：
 
 - 客户端看到的 `MessageQueue.queueId` 是**全局逻辑 ID**，
-  `brokerName` 固定为 `MixAll.LOGICAL_QUEUE_MOCK_BROKER_NAME = "__logical_queue_broker__"`
-  （占位符，仅用于识别这是逻辑队列），不再直接对应真实 Broker；
+  `brokerName` 是 mock 占位名（仅用于识别这是逻辑队列），不再直接对应真实 Broker。
+  占位名由 `TopicQueueMappingUtils.getMockBrokerName(scope)` 生成，形如
+  `__syslo__<scope>`，全局 scope（`__global__`）对应 `__syslo__global__`
+  （`MixAll.LOGICAL_QUEUE_MOCK_BROKER_PREFIX = "__syslo__"`）；
 - 生产者的 `hash(key) mod N` 里的 N 是逻辑队列总数——
   **这个数字从此与集群里有多少台机器无关**；
 - 语义保证：逻辑队列内 offset 单调递增；offset 连续降级为"尽量保证"
@@ -379,10 +383,14 @@ TopicQueueMappingContext mappingContext =
    直接返回空映射上下文（不做映射）。
 2. **查不到该 topic 的映射**（`mappingDetail == null`）：说明不是静态主题，
    返回空上下文——后续按普通队列处理，**对普通主题零影响**。
-3. **`globalId < 0` 且 `selectOneWhenMiss = true`**：客户端未指定有效逻辑队列 ID 时
-   （发送时可能传 `-1` 让 Broker 自动选），从本 Broker 托管的队列里**选一个**
-   （`hostedQueues` 的第一个 key）。这就是发送路径传 `true` 的原因——兜底选一个。
-4. **正常情况**：根据 `globalId` 找到映射条目列表 `mappingItemList`，
+3. **`globalId == null`**（请求头没带逻辑队列 ID）：返回带 `mappingDetail`
+   但没有 leaderItem 的上下文，由调用方自行处理。
+4. **`globalId < 0` 且 `!selectOneWhenMiss`**：返回空 item 的上下文。
+5. **`globalId < 0` 且 `selectOneWhenMiss = true`**：客户端未指定有效逻辑队列 ID 时
+   （发送时可能传 `-1` 让 Broker 自动选），从本 Broker 托管的队列里**任选一个**
+   （`hostedQueues` 的 keySet 迭代取一个；注意 `hostedQueues` 是 ConcurrentHashMap，
+   不保证取到最小的 queueId）。这就是发送路径传 `true` 的原因——兜底选一个。
+6. **正常情况**：根据 `globalId` 找到映射条目列表 `mappingItemList`，
    取最后一个作为 **leader item**（当前可写的物理队列），
    封装进 `TopicQueueMappingContext` 返回。
 
@@ -420,8 +428,10 @@ sequenceDiagram
 ### 6.4 消费流程
 
 拉取请求带逻辑位点，Broker 先定位它落在哪个 mapping item（哪一段），
-向对应物理队列读，返回时不做位点转换，而是附带 `OffsetDelta` 由客户端换算回
-逻辑位点（处理方式类似 Batch 消息）。位点落在旧段时，
+向对应物理队列读。Broker 返回前会把 `nextBeginOffset/minOffset/maxOffset`
+换算成逻辑位点（`PullMessageProcessor` 里的 `rewriteResponseForStaticTopic`
+用 `computeStaticQueueOffsetStrictly` 转换，对本机读取与远程转发两条路径统一生效）；
+`OffsetDelta` 额外附带，供消息体内 offset 等解码使用。位点落在旧段时，
 请求会被导向旧 Leader 读历史数据——即一次 pull 可能变成跨 Broker 远程读。
 
 其他 API 也全部要走映射换算：`getMinOffset`（读最早段的 MinOffset）、
@@ -433,17 +443,17 @@ sequenceDiagram
 
 场景：**broker-c 是新加入的机器，想让逻辑队列 3 用上它的存储。**
 
-执行 `RemappingStaticTopic`（复用 `UPDATE_AND_CREATE_STATIC_TOPIC` 命令），
-流程（"禁旧再切新"，保顺序优先）：
+执行 `RemappingStaticTopic` mqadmin 子命令（与 `UpdateStaticTopic` 并列注册，
+底层同样通过 `createStaticTopic` 发 `UPDATE_AND_CREATE_STATIC_TOPIC` 请求），
+实现采用"切新禁旧再切新"，优先保证可用性：
 
-1. 从旧 Leader（broker-b）取当前状态，计算新映射条目：
-   - 给 broker-b 的 item 封口：`endOffset = 当前最大位点`；
-   - 新增 item：`gen=2, bname=broker-c, logicOffset=封口值, endOffset=-1`（未定）。
+1. 从旧 Leader（broker-b）取当前状态，先写入新映射条目（logicOffset 未定）；
 2. **禁写旧 Leader**（broker-b 不再接受该队列的新写入）；
-3. 新 Leader（broker-c）开始接受写入，确定 `logicOffset` 后正式生效。
+3. 用旧 Leader 的 `maxOffset` 经 `blockSeqRoundUp`（默认 `blockSeqSize=10000`，
+   向上取整预留空洞）确定新 Leader 的 `logicOffset`，回写新 Leader 条目；
+4. 向其余非目标 Broker 广播更新后的映射。
 
-如果优先保证可用性，则采用"切新禁旧再切新"：先让新 Leader 可写
-（此时 logicOffset 未定），再禁写旧 Leader，最后更新新 Leader 确定 logicOffset。
+如果优先保证顺序，则采用"禁旧再切新"：先封口禁写旧 Leader，再让新 Leader 可写。
 两种方式都保证映射数据至少成功存储一份，失败可手工恢复。
 
 全程观察各方的视角：
@@ -608,8 +618,9 @@ $$\text{逻辑位点} = \text{logicOffset} + (\text{物理位点} - \text{startO
 
 > "如果是做应用集成，则可能不是必需的，但如果是做数据集成，则是必需的。"
 
-这也是为什么它通过独立的 Admin 命令（`UpdateStaticTopic`，指定 `-t/-qn/-c|-b`）
-显式创建，而不是成为默认行为；`UpdateTopic` 命令被禁止修改静态主题。
+这也是为什么它通过独立的 Admin 命令显式创建，而不是成为默认行为：
+`UpdateStaticTopic`（`-t` topic、`-qn` 队列数、`-c` cluster / `-b` broker 二选一均必填，
+可选 `-mf` 映射文件、`-fr` 强制替换）与 `RemappingStaticTopic` 是两个并列的子命令。
 
 补充一点：即使不用 Static Topic，如果应用使用了顺序消息且集群频繁弹性伸缩，
 也要意识到传统模式下每次扩容都是一次短暂的乱序风险窗口，
