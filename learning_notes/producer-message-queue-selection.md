@@ -179,7 +179,7 @@ topic + brokerName + queueId
 ## 重试时会切换 Broker 吗？
 
 **结论：不是固定的。同步与异步发送重试时都会优先切换到其他 Broker**
-（仅当 `topicPublishInfo` 拿不到时才回退原 Broker）。
+（若路由为空，或过滤后没有其他 Broker 的候选队列，会回退到完整队列列表，仍可能选回原 Broker）。
 
 ### 同步发送（SYNC）— 会切换 Broker
 
@@ -228,15 +228,16 @@ if (topicPublishInfo != null) {
 当前失败的 `brokerName` 作为 `lastBrokerName`。`brokerFilter` 的生效条件只看
 `lastBrokerName` 是否为 null，与 `resetIndex` 无关（`resetIndex` 只控制是否重置轮询
 游标）。因此只要 `topicPublishInfo` 可用，异步重试就会**优先选一个其他 Broker 的
-队列**；代码注释里的 "by default, it will send to the same broker" 指的是
-`topicPublishInfo == null` 时的兜底行为。
+队列**；如果过滤后没有候选队列，选择器会回退到完整队列列表。代码注释里的
+"by default, it will send to the same broker" 只说明 `topicPublishInfo == null` 时的初始兜底，
+并不排除“路由存在但只有原 Broker”时的回退。
 
 ### 汇总
 
 | 发送方式 | 重试是否换 Broker | 控制参数 |
 | --- | --- | --- |
 | 同步 SYNC | ✅ 优先换到其他 Broker | `retryTimesWhenSendFailed`（默认 2） |
-| 异步 ASYNC | ✅ 优先换到其他 Broker（`topicPublishInfo == null` 时兜底原 Broker） | `retryTimesWhenSendAsyncFailed`（默认 2） |
+| 异步 ASYNC | ✅ 优先换到其他 Broker（路由为空或无其他候选时可能回到原 Broker） | `retryTimesWhenSendAsyncFailed`（默认 2） |
 | ONEWAY | 无重试 | — |
 
 另外补充一点：即使换了 Broker，如果消息发送成功但返回的是 `FLUSH_DISK_TIMEOUT` /

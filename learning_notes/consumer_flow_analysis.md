@@ -288,8 +288,8 @@ switch (pullResult.getPullStatus()) {
 ```java
 // ProcessQueue.java（主要字段，节选）
 public class ProcessQueue {
-    private final TreeMap<Long, MessageExt> msgTreeMap;      // 消息缓存（并发）
-    private final TreeMap<Long, MessageExt> consumingMsgOrderlyTreeMap; // 顺序消费专用缓存
+    private final TreeMap<Long, MessageExt> msgTreeMap;      // 通用消息缓存
+    private final TreeMap<Long, MessageExt> consumingMsgOrderlyTreeMap; // msgTreeMap 的顺序消费子集
     private final AtomicLong msgCount;                        // 消息计数
     private final AtomicLong msgSize;                         // 消息大小
     private volatile long queueOffsetMax = 0L;                // 已见最大 offset
@@ -297,7 +297,7 @@ public class ProcessQueue {
     private volatile boolean locked = false;                  // 是否锁定(顺序消费)
     private volatile boolean consuming = false;               // 是否正在消费(并发)
     private final ReadWriteLock treeMapLock = new ReentrantReadWriteLock(); // 保护两个 TreeMap
-    private final ReentrantLock consumeLock = new ReentrantLock(); // 顺序消费取消息锁
+    private final ReadWriteLock consumeLock = new ReentrantReadWriteLock(); // 顺序消费锁
     private volatile long lastPullTimestamp = System.currentTimeMillis();
     private volatile long lastLockTimestamp = System.currentTimeMillis();  // 锁续期判断依据
 }

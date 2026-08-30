@@ -202,7 +202,7 @@ SendResult result = producer.send(messages);
 约束检查分两处：同 Topic/同 `waitStoreMsgOK`/禁延时与 Retry Topic 由
 [`MessageBatch.generateFromList`](../common/src/main/java/org/apache/rocketmq/common/message/MessageBatch.java)
 检查，而逐条与整批的大小限制由 `DefaultMQProducer.batch()` 及 `sendDefaultImpl`
-里的 [`Validators.checkMessage`](../common/src/main/java/org/apache/rocketmq/common/message/Validators.java)
+里的 [`Validators.checkMessage`](../client/src/main/java/org/apache/rocketmq/client/Validators.java)
 检查。
 
 需要类似 Kafka Producer 的透明攒批时，可以在 `start()` 前开启 autoBatch：

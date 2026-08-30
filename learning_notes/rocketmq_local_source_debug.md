@@ -182,11 +182,12 @@ ROCKETMQ_HOME=$PROJECT_DIR$
 
 ### 端口被占用
 
-NameServer 默认使用 `9876`，Broker 默认使用 `10911`（`BrokerStartup` 强制设置
-listenPort）和 `10912`（HA 复制端口，`haListenPort` 或 listenPort+1）：
+NameServer 默认使用 `9876`，Broker 默认使用 `10911`（主 Remoting Server）、
+`10909`（fast Remoting Server，`listenPort - 2`）和 `10912`（HA 复制端口，
+`haListenPort` 或 listenPort+1；`BrokerStartup` 默认将主端口设为 10911）：
 
 ```shell
-ss -ltnp | rg ':(9876|10911|10912)\b'
+ss -ltnp | rg ':(9876|10909|10911|10912)\b'
 ```
 
 停止占用端口的旧进程后再启动。

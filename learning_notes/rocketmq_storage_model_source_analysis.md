@@ -62,7 +62,7 @@ flowchart LR
     subgraph msg["一条消息（MessageExtEncoder.java:175 编码，大端序）"]
         direction LR
         A["TOTALSIZE 4B"] --- B["MAGICCODE 4B"] --- C["BODYCRC 4B"] --- D["QUEUEID 4B"] --- E["FLAG 4B"]
-        E --- F["QUEUEOFFSET 8B<br/>写入时回填"] --- G["PHYSICALOFFSET 8B<br/>写入时回填"] --- H["SYSFLAG 4B"]
+        E --- F["QUEUEOFFSET 8B<br/>编码前由 assignOffset 设置"] --- G["PHYSICALOFFSET 8B<br/>写入时回填"] --- H["SYSFLAG 4B"]
         H --- I["BORNTIMESTAMP 8B"] --- J["BORNHOST 8/20B"] --- K["STORETIMESTAMP 8B"] --- L["STOREHOST 8/20B"]
         L --- M["RECONSUMETIMES 4B"] --- N["PREPARED_TX_OFFSET 8B"]
         N --- O["BODY 4B+len"] --- P2["TOPIC 1/2B+len"] --- Q2["PROPERTIES 2B+len"]

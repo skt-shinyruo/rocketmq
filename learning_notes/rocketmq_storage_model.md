@@ -67,10 +67,12 @@ Producer ──Send Message──→ CommitLog ──异步分发──→ Reput
                         Consumer                                    Query API
                                                               (按Key查询)
 
-延时消息链路（独立于 reput 分发）：
-Producer ──Send Message──→ CommitLog(rmq_sys_wheel_timer)
-                              └──→ TimerMessageStore.TimerEnqueueGetService
-                                     └──→ TimerLog/TimerWheel ──到期改写──→ Delay Consumer
+延时消息链路（TimerLog 写入独立于 reput 分发，但依赖其构建 Timer Topic 的 ConsumeQueue）：
+Producer ──Send Message──→ Broker HookUtils.transformTimerMessage
+                              └──→ CommitLog(rmq_sys_wheel_timer)
+                                     └──→ Reput 构建 Timer Topic ConsumeQueue
+                                            └──→ TimerMessageStore.TimerEnqueueGetService
+                                                   └──→ TimerLog/TimerWheel ──到期改写──→ Delay Consumer
 ```
 
 **组件依赖关系**：
@@ -87,14 +89,15 @@ CommitLog ──依赖──→ MappedFile ──借用──→ TransientStoreP
   ├──持久化──→ StoreCheckpoint (检查点)
   │
   └──清理──→ CleanCommitLogService（只清 CommitLog）
-                ConsumeQueue/IndexFile/TimerLog 由 CleanConsumeQueueService /
-                CleanIndexService / CleanTimerLogService 各自清理
-                （ConsumeQueue 清理会连带删除其归属的 IndexFile）
+                ConsumeQueueStore.CleanConsumeQueueService
+                （按 CommitLog 最小物理位点清理 ConsumeQueue，并调用 IndexService
+                 删除过期 IndexFile）
+                TimerMessageStore 内部定时任务（按 CommitLog 最小物理位点清理 TimerLog）
 ```
 
 **子系统划分**：
 - **存储核心**：CommitLog（消息主体）、ConsumeQueue（消费索引）、IndexFile（Key索引）、TimerLog（延时消息）
-- **服务线程**：ReputMessageService（异步分发）、FlushManager（刷盘）、AllocateMappedFileService（预分配）、CleanCommitLogService/CleanConsumeQueueService/CleanIndexService（清理）
+- **服务线程**：ReputMessageService（异步分发）、FlushManager（刷盘）、AllocateMappedFileService（预分配）、CleanCommitLogService、ConsumeQueueStore.CleanConsumeQueueService、TimerMessageStore 定时清理任务（清理）
 - **存储优化**：TransientStorePool（堆外内存）、MappedFile（内存映射）
 - **高可用与恢复**：HAService（主从同步）、StoreCheckpoint（故障恢复）
 
@@ -491,7 +494,7 @@ public static final short SIZE = 32; // Slot 大小
 
 ### 3.1 ReputMessageService
 
-**核心职责**：Broker 后台服务线程，异步构建 ConsumeQueue 和 IndexFile（以及 Compaction 分发）。注意：**TimerLog 索引不经过 reput 分发链**——延时消息先由 Producer 端改写落入系统 Topic `rmq_sys_wheel_timer`，由 `TimerMessageStore` 自己的 `TimerEnqueueGetService` 从该 Topic 的 ConsumeQueue 读取后经 `enqueue()` 写入 TimerLog/TimerWheel。
+**核心职责**：Broker 后台服务线程，异步构建 ConsumeQueue 和 IndexFile（以及 Compaction 分发）。注意：**TimerLog 索引不由 reput 分发器直接构建**——Broker 的 `HookUtils.transformTimerMessage` 先把定时消息改写为系统 Topic `rmq_sys_wheel_timer`；reput 负责构建该 Topic 的 ConsumeQueue，随后由 `TimerMessageStore` 的 `TimerEnqueueGetService` 从 ConsumeQueue 读取，再经 `enqueue()` 写入 TimerLog/TimerWheel。
 
 **工作流程**：
 
@@ -506,7 +509,7 @@ CommitLog ──新消息写入──→ ReputService ──触发 reput──�
                         ConsumeQueue                    IndexService
                         (写入索引条目)                   (写入 Key 索引)
 
-（延时消息不走此链路：rmq_sys_wheel_timer → TimerEnqueueGetService → TimerLog/TimerWheel）
+（TimerLog 不走此分发器：rmq_sys_wheel_timer → Reput 构建 ConsumeQueue → TimerEnqueueGetService → TimerLog/TimerWheel）
 ```
 
 **处理流程**：
@@ -1150,7 +1153,7 @@ RocketMQ 5.x 支持 RocksDB 作为存储引擎，提供更灵活的存储方案�
 | **ConsumeQueue** | 定长索引文件 | 支持（RocksDBConsumeQueue） |
 | **Index** | Hash 索引文件 | 支持（IndexRocksDBStore） |
 | **Timer** | 时间轮文件 | 支持（TimerMessageRocksDBStore） |
-| **Transaction** | 系统 Topic（RMQ_SYS_TRANS_HALF_TOPIC） | 支持（TransMessageRocksDBStore） |
+| **Transaction** | 系统 Topic（默认 `RMQ_SYS_TRANS_HALF_TOPIC`） | 支持（`transRocksDBEnable=true` 且 `transWriteOriginTransHalfEnable=false` 时使用 `RMQ_SYS_ROCKSDB_TRANS_HALF_TOPIC`，由 TransMessageRocksDBStore 建索引） |
 
 **配置参数**：
 
@@ -1461,14 +1464,18 @@ RocketMQ 使用内部系统 Topic 存储事务消息，而非独立的事务表�
 
 | 系统 Topic | 用途 |
 |-----------|------|
-| `RMQ_SYS_TRANS_HALF_TOPIC` | 存储半消息（未提交的事务消息） |
+| `RMQ_SYS_TRANS_HALF_TOPIC` | 默认存储半消息（未提交的事务消息）；RocksDB Topic 模式改用 `RMQ_SYS_ROCKSDB_TRANS_HALF_TOPIC` |
+| `RMQ_SYS_ROCKSDB_TRANS_HALF_TOPIC` | `transRocksDBEnable=true` 且 `transWriteOriginTransHalfEnable=false` 时存储半消息 |
 | `RMQ_SYS_TRANS_OP_HALF_TOPIC` | 存储操作消息（Commit/Rollback 指令） |
+| `RMQ_SYS_ROCKSDB_TRANS_OP_HALF_TOPIC` | RocksDB 事务 Topic 模式下存储操作消息 |
 
 **存储实现**（[TransactionalMessageBridge.java](file:///home/feng/code/opensource/rocketmq/broker/src/main/java/org/apache/rocketmq/broker/transaction/queue/TransactionalMessageBridge.java)）：
 
-- 半消息写入 `RMQ_SYS_TRANS_HALF_TOPIC`，不构建消费索引，对 Consumer 不可见
-- Commit 指令写入 `RMQ_SYS_TRANS_OP_HALF_TOPIC`，触发半消息投递到真实 Topic
-- Rollback 指令写入 `RMQ_SYS_TRANS_OP_HALF_TOPIC`，删除半消息
+- 默认半消息写入 `RMQ_SYS_TRANS_HALF_TOPIC`，不构建消费索引，对 Consumer 不可见；当
+  `transRocksDBEnable=true` 且 `transWriteOriginTransHalfEnable=false` 时，改写为
+  `RMQ_SYS_ROCKSDB_TRANS_HALF_TOPIC`，由 RocksDB 事务存储建立索引。
+- 默认 Commit/Rollback 指令写入 `RMQ_SYS_TRANS_OP_HALF_TOPIC`；RocksDB 事务 Topic
+  模式对应 `RMQ_SYS_ROCKSDB_TRANS_OP_HALF_TOPIC`。
 
 **RocksDB 存储支持**：
 
@@ -1477,6 +1484,7 @@ RocketMQ 使用内部系统 Topic 存储事务消息，而非独立的事务表�
 | 参数 | 默认值 | 说明 |
 |-----|-------|------|
 | `transRocksDBEnable` | false | 是否启用 RocksDB 事务存储 |
+| `transWriteOriginTransHalfEnable` | true | 启用 RocksDB 时是否仍将半消息写入原事务 Topic；设为 false 才使用 RocksDB 事务 Topic |
 
 ### 11.3 事务索引构建
 
@@ -1682,7 +1690,7 @@ Pull 消息时先读取 ConsumeQueue 索引
 | ConsumeQueue | 定长索引文件 | 支持 |
 | IndexFile | Hash 索引文件 | 支持 |
 | TimerLog | 时间轮文件 | 支持 |
-| Transaction | 系统 Topic（RMQ_SYS_TRANS_HALF_TOPIC） | 支持 |
+| Transaction | 系统 Topic（默认 `RMQ_SYS_TRANS_HALF_TOPIC`；RocksDB Topic 模式为 `RMQ_SYS_ROCKSDB_TRANS_HALF_TOPIC`） | 支持 |
 
 ---
 
