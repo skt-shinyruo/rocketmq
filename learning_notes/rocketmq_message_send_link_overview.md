@@ -185,6 +185,8 @@ Broker 返回的 ResponseCode 映射为 `SendStatus`(`processSendResponse`):
 | 其他错误码 | 抛 `MQBrokerException` | 仅响应码属于 `retryResponseCodes` 时，`sendDefaultImpl()` 才重试 |
 
 注意：非 `SEND_OK` 状态下消息可能实际已写入成功，只是没在超时内确认；此时客户端重试会产生重复消息，需要消费端幂等。
+展开讨论（失败分类、规避方式、与 Kafka 幂等 Producer 的对比）见
+[`rocketmq_send_retry_and_idempotency.md`](rocketmq_send_retry_and_idempotency.md)。
 
 ## 五、关键设计总结
 

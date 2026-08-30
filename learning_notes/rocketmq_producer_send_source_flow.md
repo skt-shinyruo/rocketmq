@@ -960,7 +960,8 @@ Producer                Broker
 所以 RocketMQ 普通发送的重试机制体现的是 at-least-once 取向，也为业务实现至少
 一次投递提供基础；有限重试本身不是交付保证，更不是天然 exactly-once。业务应以
 订单号、事件 ID 等稳定业务主键做消费幂等，不能把客户端 `send()` 的一次调用等同于
-Broker 里恰好一条记录。
+Broker 里恰好一条记录。与 Kafka 幂等 Producer 的对比、以及业务侧规避清单见
+[`rocketmq_send_retry_and_idempotency.md`](rocketmq_send_retry_and_idempotency.md)。
 
 ### 12.2 默认异步路径
 

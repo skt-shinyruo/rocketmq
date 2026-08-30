@@ -270,3 +270,7 @@ producer.send(message, (queues, msg, arg) -> {
 
 此时客户端仍负责获取 Topic 的可写队列列表，但最终选择哪个 Queue 由调用方的
 `MessageQueueSelector` 决定，而不再走默认轮询策略。
+
+同一业务键进同一队列只解决「分区有序」的路由问题。同一 `orderId` 上创建、支付、
+发货仍须按因果顺序发送，消费侧还要使用顺序监听器。完整约束与实现见
+[RocketMQ 顺序消息：生产投递与因果顺序](rocketmq_ordered_message.md)。

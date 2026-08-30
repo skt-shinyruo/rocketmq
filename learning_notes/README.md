@@ -9,6 +9,8 @@
 - [Broker 收到 Producer 消息后的处理全流程](rocketmq_broker_receive_message_processing.md)
 - [MessageQueue 概念详解](messagequeue-concept.md)
 - [Producer MessageQueue 选择逻辑](producer-message-queue-selection.md)
+- [RocketMQ 发送重试、重复消息与幂等](rocketmq_send_retry_and_idempotency.md)
+- [RocketMQ 顺序消息：生产投递与因果顺序](rocketmq_ordered_message.md)
 - [`tryToFindTopicPublishInfo` 在发送过程中做什么](rocketmq_message_send_and_consume_flow.md)
 - [RocketMQ 消息存储模型详解](rocketmq_storage_model.md)
 - [RocketMQ 存储模型源码导读（含 Mermaid 图）](rocketmq_storage_model_source_analysis.md)
@@ -16,3 +18,4 @@
 - [RocketMQ 静态主题（Static Topic / Logic Queue）](rocketmq_static_topic_logic_queue.md)
 - [RocketMQ 本地源码 Debug](rocketmq_local_source_debug.md)
 - [RocketMQ DefaultMQPushConsumer Pull 消费流程分析](consumer_flow_analysis.md)
+- [Push 并发消费：位点提交、重试与死信](rocketmq_concurrent_consume_offset.md)

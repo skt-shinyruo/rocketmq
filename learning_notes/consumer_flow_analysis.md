@@ -631,3 +631,6 @@ Consumer 启动
 5. **顺序消费的锁机制**: 集群顺序消费通过 Broker `lockBatchMQ` 维持队列归属，并通过本地 `MessageQueueLock` 串行调用监听器；它不提供端到端 exactly-once 语义，业务仍需处理重复消费。
 
 6. **Rebalance 的队列撤销**: 先把不再归属的 `ProcessQueue` 标为 `dropped`，再尝试清理。顺序消费会争取本地消费锁后再解锁并移除；并发消费中的任务可能完成用户回调，但 dropped 后不会再提交其消费结果。
+
+生产侧如何把同一订单固定到同一队列、以及发送因果顺序，见
+[RocketMQ 顺序消息：生产投递与因果顺序](rocketmq_ordered_message.md)。
