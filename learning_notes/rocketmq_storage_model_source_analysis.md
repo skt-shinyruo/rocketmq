@@ -1,6 +1,6 @@
 # RocketMQ 存储模型源码导读（含 Mermaid 图）
 
-> 本文基于仓库 develop 分支（RocketMQ 5.x）源码逐文件阅读整理，所有结论均附源码文件与行号引用，可与 [rocketmq_storage_model.md](rocketmq_storage_model.md)（概念全景版）对照阅读。
+> 本文基于仓库 `learning` 分支（RocketMQ 5.5.x）源码逐文件阅读整理，所有结论均附源码文件与行号引用，可与 [rocketmq_storage_model.md](rocketmq_storage_model.md)（概念全景版）对照阅读。
 
 ## 一、总体架构：一个日志 + 两级派生索引
 
@@ -20,8 +20,9 @@ flowchart LR
 
     C -->|按 tagHashCode 预过滤<br/>命中后拿 offset+size 回查| CL
     C[Consumer] -->|拉取| CQ
-    Q[按 MsgId/Key 查询] --> IDX
+    Q[按业务 Key 或 UNIQ_KEY 查询] --> IDX
     IDX -->|返回 phyOffsets| CL
+    Q2[按物理 offsetMsgId 查询] -->|直接解码地址和物理偏移| CL
 ```
 
 关键点：**ConsumeQueue 和 IndexFile 都只是 CommitLog 的派生视图**，宕机后可重放 dispatch 重建。
@@ -42,7 +43,11 @@ flowchart LR
 | `config/` | topics.json、consumerOffset.json 等元数据 |
 | `transaction/`、`timerwheel/` | 事务消息与定时消息的存储 |
 
-所有文件都由 `MappedFileQueue` 统一管理——一个 `CopyOnWriteArrayList<MappedFile>`（`MappedFileQueue.java:48`）加全局刷盘水位 `flushedWhere`，每个文件是 mmap 内存映射。**文件名就是该文件的全局起始偏移量**（20 位补零数字），因此"全局 offset → 文件"就是一次除法取下标（`findMappedFileByOffset`，`MappedFileQueue.java:695`）。
+CommitLog 和文件型 ConsumeQueue 主要由 `MappedFileQueue` 管理——内部是
+`CopyOnWriteArrayList<MappedFile>` 和刷盘水位；IndexFile 则由 `IndexService` 维护自己的
+IndexFile 列表，RocksDB/Tiered 存储也有独立实现。文件名通常是该文件的全局起始偏移量，
+因此 CommitLog 的“全局 offset -> 文件”可以通过 `findMappedFileByOffset` 定位，但不能把
+所有存储文件都归结为同一套 MappedFileQueue。
 
 ## 三、CommitLog：消息本体
 
@@ -51,7 +56,9 @@ flowchart LR
 - 单文件默认 1GB：`MessageStoreConfig.java:52`（`mappedFileSizeCommitLog = 1024 * 1024 * 1024`）。
 - 文件名即起始物理偏移（`UtilAll.offset2FileName()`，`common/src/main/java/org/apache/rocketmq/common/UtilAll.java:107-113`），如 `00000000001073741824`；加载时 `Long.parseLong(fileName)` 得到 `fileFromOffset`（`DefaultMappedFile.java:203`）。
 - 写满时若剩余空间不够放一条消息（含最小空隙 `END_FILE_MIN_BLANK_LENGTH = 4+4`，`CommitLog.java:1894`），写 8 字节 `{TOTALSIZE=maxBlank, MAGICCODE=BLANK_MAGIC_CODE(-875286124)}` 占位（`CommitLog.java:2021-2035`）再滚动新文件。正常消息的 MAGICCODE 是 `-626843481`（`CommitLog.java:79`）。
-- 新文件由 `AllocateMappedFileService` 后台提前 mmap + 预热（`warmMappedFile()` 逐页写 0 并 mlock，`DefaultMappedFile.java:797-835`），保证写路径永远不会同步建文件。
+- 新文件通常由 `AllocateMappedFileService` 异步创建；只有开启 `warmMapedFileEnable=true`
+  且未使用 `writeWithoutMmap` 时才会逐页预热（`warmMappedFile()`）。创建请求仍可能等待
+  后台服务或超时，不能保证写路径永远不发生阻塞。
 
 ### 3.2 单条消息字节布局
 
@@ -74,7 +81,9 @@ flowchart LR
 - PHYSICALOFFSET 编码时先置 0（`MessageExtEncoder.java:234`，注释 "need update later"），真正写入时在全局锁内由 `doAppend` 回填（`CommitLog.java:2037` 起）；QUEUEOFFSET 编码时写入的已经是 `assignOffset` 分配好的真实队列偏移（`MessageExtEncoder.java:232`）。
 - 开启 `enabledAppendPropCRC` 时 properties 尾部预留 `CRC32_RESERVED_LEN` 字节（`CommitLog.java:86`），由 `doAppend` 在锁内计算整条消息的 CRC32 写入（`CommitLog.java:2053-2061`）。
 - 批量消息由 `encode(MessageExtBatch, ...)`（`MessageExtEncoder.java:282-383`）编码为多条完整布局消息的连续字节流，`doAppend` 批量版本（`CommitLog.java:2083-2178`）逐条回填。
-- 消息的 msgId 就是 `storeHost:port + physicalOffset` 拼出来的（`CommitLog.java:1990-1998`）——**所以 RocketMQ 的消息 ID 天然能直接定位到 CommitLog 中的物理位置**。
+- CommitLog 生成的物理 `offsetMsgId` 是 `storeHost:port + physicalOffset`（`CommitLog.java:1990-1998`），
+  可以直接定位 CommitLog。Producer `SendResult.msgId` 通常是客户端生成的 `UNIQ_KEY`；按它或
+  按业务 Key 查询时仍要经过 IndexFile，不能把两种 ID 都画成直接物理定位。
 - 读取端对称解析见 `CommitLog.checkMessageAndReturnSize()`（`CommitLog.java:451-670`）。
 
 ### 3.3 写入链路
@@ -90,7 +99,6 @@ sequenceDiagram
 
     T->>TQL: lock(topic-queue)
     T->>TQL: assignOffset 分配队列 offset<br/>+ 线程本地 encoder 编码（锁内）
-    T->>TQL: unlock
     T->>PML: lock
     T->>MF: appendMessage → doAppend<br/>回填 queueOffset/physicalOffset/CRC
     alt 文件写满 (END_OF_FILE)
@@ -98,13 +106,15 @@ sequenceDiagram
         T->>MF: 取预建的新文件重写
     end
     T->>PML: unlock
+    T->>TQL: increaseOffset（写入成功后）
+    T->>TQL: unlock
     T->>FM: handleDiskFlush
     alt 同步刷盘 SYNC_FLUSH
         FM->>FM: GroupCommitService 组提交<br/>直到 flushedWhere ≥ 消息末尾
     else 异步刷盘 ASYNC_FLUSH
         FM-->>T: 立即返回 PUT_OK<br/>FlushRealTimeService 每 500ms 后台刷
     end
-    T->>HA: handleHA（SYNC_MASTER 时等 slave ACK）
+    T->>HA: handleHA（配置的 needAckNums > 1 时等待副本 ACK）
 ```
 
 要点（入口 `CommitLog.asyncPutMessage()`，`CommitLog.java:969-1140`）：
@@ -126,7 +136,7 @@ sequenceDiagram
 | 同步刷盘 | `GroupCommitService`（`CommitLog.java:1675-1781`） | 读写双链表 swap 组提交，每 10ms 批量 flush；写线程等 `flushedWhere >= 消息末尾` 才返回（`syncFlushTimeout` 默认 5s，`MessageStoreConfig.java:249`） |
 | 异步刷盘（默认） | `FlushRealTimeService`（`CommitLog.java:1548-1632`） | 每 500ms（`flushIntervalCommitLog`）刷一次，攒满 4 页（`flushCommitLogLeastPages`）才刷，超过 10s（`flushCommitLogThoroughInterval`）强制全刷 |
 | 异步刷盘 + transientStorePool | `CommitRealTimeService`（`CommitLog.java:1493-1546`） | 先把堆外 writeBuffer commit 到 FileChannel（每 200ms），再唤醒 flush |
-| 同步复制 | `handleHA`（`CommitLog.java:1355-1370`） | SYNC_MASTER 且 `needAckNums > 1` 时等足够 slave 的 ACK |
+| 同步复制 | `handleHA`（`CommitLog.java:1355-1370`） | `SYNC_MASTER` 且配置的 `needAckNums > 1` 时等足够副本的 ACK；默认值 1 会直接成功 |
 
 底层 flush：`MappedFileQueue.flush()`（658-673 行）→ `DefaultMappedFile.flush()`（526-559 行）→ `mappedByteBuffer.force()` 或 `fileChannel.force(false)`。
 
@@ -211,7 +221,7 @@ flowchart LR
 
 ### 6.1 过期删除
 
-- **CleanCommitLogService**（`DefaultMessageStore.java:2301-2573`）：每 10s（`cleanResourceInterval`）检查。触发条件三选一：到达 `deleteWhen`（默认凌晨 4 点）、磁盘超阈值（`diskSpaceWarningLevelRatio` 默认 90%，超过即标记磁盘满拒写；另有 `diskSpaceCleanForciblyRatio` 默认 85% 触发强制清理；`diskMaxUsedSpaceRatio = 75%` 只在多路径按磁盘分区分组场景参与清理判断）、手动删除。删除依据是**文件最大时间戳超过 `fileReservedTime`（默认 72 小时，`MessageStoreConfig.java:188`）**。
+- **CleanCommitLogService**（`DefaultMessageStore.java:2301-2573`）：每 10s（`cleanResourceInterval`）检查。触发条件包括到达 `deleteWhen`（默认凌晨 4 点）、磁盘使用率达到清理判断阈值或手动删除。`diskSpaceWarningLevelRatio` 默认 90%，超过会标记磁盘满并进入立即清理；`diskSpaceCleanForciblyRatio` 默认 85% 会触发更激进的清理；`diskMaxUsedSpaceRatio = 75%` 在普通单路径以及多路径逻辑容量判断中也会参与清理触发。删除依据是**文件最大时间戳超过 `fileReservedTime`（默认 72 小时，`MessageStoreConfig.java:188`）**。
 - **CleanConsumeQueueService**（`queue/ConsumeQueueStore.java:867-907`）：CQ 不按时间删除，而是**跟着 CommitLog 走**——`commitLog.getMinOffset()` 前进后，删除各 CQ 中 maxPhysicOffset 落后的文件，并同步删除过期 index 文件（897-900 行）。这是"CQ 只是视图"的直接体现。
 
 ### 6.2 启动恢复流程

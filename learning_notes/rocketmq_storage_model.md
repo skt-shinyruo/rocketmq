@@ -517,7 +517,7 @@ for (CommitLogDispatcher dispatcher : this.dispatcherList) {
 
 | 策略 | 优点 | 缺点 | 适用场景 |
 |-----|------|------|---------|
-| **SYNC_FLUSH** | 数据零丢失 | 延迟高、吞吐量低 | 金融交易、核心业务 |
+| **SYNC_FLUSH** | 成功响应前完成本机刷盘 | 延迟高、吞吐量低 | 需要降低进程/断电丢失窗口的业务 |
 | **ASYNC_FLUSH** | 延迟低、吞吐量高 | 断电可能丢失数据 | 日志收集、实时计算 |
 
 **同步刷盘流程**（SYNC_FLUSH）：
@@ -529,7 +529,8 @@ for (CommitLogDispatcher dispatcher : this.dispatcherList) {
 步骤4: Disk ──刷盘完成──→ Broker
 步骤5: Broker ──Return ACK──→ Producer
 
-特点：数据零丢失，但延迟高、吞吐量低
+特点：成功响应前等待本机 `flush()` 完成，降低进程崩溃或断电时的丢失窗口，但不能覆盖
+磁盘损坏、控制器缓存未持久化等所有故障，因此不能单独承诺“零丢失”。
 ```
 
 **异步刷盘流程**（ASYNC_FLUSH）：
@@ -673,7 +674,8 @@ public ByteBuffer borrowBuffer() {
 
 ### 3.5 CleanCommitLogService
 
-**核心职责**：定期清理过期的 CommitLog、ConsumeQueue 和 IndexFile 文件。
+**核心职责**：定期清理过期的 CommitLog。ConsumeQueue 和 IndexFile 由
+`ConsumeQueueStore.CleanConsumeQueueService` 根据 CommitLog 最小有效偏移另行清理。
 
 **清理策略**：
 
@@ -683,9 +685,9 @@ public ByteBuffer borrowBuffer() {
     ↓
 检查磁盘使用率
     │
-    ├──> diskMaxUsedSpaceRatio (75%) ──→ 强制清理
+    ├──> diskSpaceCleanForciblyRatio (85%) ──→ 立即清理并允许更激进的删除
     │                                           │
-    └──< diskMaxUsedSpaceRatio ──→ 检查文件过期时间
+    └──< diskSpaceCleanForciblyRatio ──→ 由 diskMaxUsedSpaceRatio、deleteWhen 或手工触发清理
                                               │
                                               ├──> fileReservedTime (72小时) ──→ 清理过期文件
                                               │                                           │
@@ -704,7 +706,7 @@ public ByteBuffer borrowBuffer() {
 | `fileReservedTime` | 72 hours | 文件保留时间 |
 | `deleteWhen` | "04" | 清理时间点（凌晨4点） |
 | `deleteFileBatchMax` | 10 | 单次删除文件数量上限 |
-| `diskMaxUsedSpaceRatio` | 75% | 磁盘使用率上限 |
+| `diskMaxUsedSpaceRatio` | 75% | 普通单路径空间达到该比例时进入清理判断；多路径时也参与逻辑容量判断 |
 | `diskSpaceCleanForciblyRatio` | 85% | 强制清理阈值 |
 
 ### 3.6 StoreCheckpoint
@@ -889,7 +891,10 @@ public static MessageId decodeMessageId(final String msgId) {
 }
 ```
 
-**查询方式**：解析 MessageId 获取 Broker 地址和物理偏移量，直接定位到对应的 CommitLog 文件读取消息，无需索引查找。
+**查询方式**：这里的 MessageId 指物理 `offsetMsgId`。解析它可以直接获得 Broker 地址和
+CommitLog 物理偏移量，无需 IndexFile。Producer 返回的 `SendResult.msgId` 通常是客户端
+生成的 `UNIQ_KEY`；按这个值或按业务 Key 查询时，仍需走 `IndexFile`（或对应的 RocksDB
+索引），不能把两种 ID 混为一谈。
 
 ---
 
@@ -921,14 +926,19 @@ NameServer
 ```
 步骤1: Producer ──Send Message──→ Master
 步骤2: Master ──写入 CommitLog──→ Master
-步骤3: Master ──同步复制消息──→ Slave
-步骤4: Slave ──ACK 确认──→ Master
-步骤5: Master ──Return ACK──→ Producer
+步骤3: needAckNums > 1 时，Master ──复制消息──→ Slave
+步骤4: 足够数量的 Slave ──ACK 确认──→ Master
+步骤5: 达到配置的 ACK 数后 Master ──Return ACK──→ Producer
 
-优点：数据零丢失
+优点：可将副本确认纳入发送成功边界
 缺点：延迟高、吞吐量低
 适用：金融交易、核心业务
 ```
+
+`SYNC_MASTER` 本身不等于一定等待 Slave。当前 `inSyncReplicas` 默认是 1，且 Master 自身
+计入该数量；`needAckNums <= 1` 时 `handleHA` 会直接成功。要等待至少一个 Slave，必须把
+所需 ACK 数配置为大于 1，并保证 ISR 数量满足要求。即使如此，同步复制也只是降低副本故障
+下的数据丢失概率，不能覆盖所有软硬件故障。
 
 **异步复制**（ASYNC_MASTER）：
 
@@ -1068,7 +1078,7 @@ class ColdDataCheckService extends ServiceThread {
 
 ### 7.3 多路径存储
 
-支持将 CommitLog 分布在多个磁盘路径，提升写入吞吐量：
+支持将连续的 CommitLog 文件分布在多个磁盘路径，用于容量扩展和磁盘故障隔离：
 
 ```java
 if (storePath.contains(MixAll.MULTI_PATH_SPLITTER)) {
@@ -1082,6 +1092,9 @@ if (storePath.contains(MixAll.MULTI_PATH_SPLITTER)) {
 ```
 storePathCommitLog=/disk1/store/commitlog,/disk2/store/commitlog,/disk3/store/commitlog
 ```
+
+Broker 仍只有一条全局 CommitLog，append 也受全局 `putMessageLock` 串行化；多路径不会让
+多条消息同时写入多个活跃 CommitLog 文件，因此不能简单等同于线性提升写入吞吐量。
 
 ### 7.4 RocksDB 存储引擎
 
@@ -1099,7 +1112,7 @@ RocketMQ 5.x 支持 RocksDB 作为存储引擎，提供更灵活的存储方案�
 
 | 参数 | 默认值 | 说明 |
 |-----|-------|------|
-| `storeType` | DEFAULT | 存储类型（DEFAULT / ROCKSDB） |
+| `storeType` | `default` | 可用值为 `default`、`defaultRocksDB`，也可用分号组合 |
 | `rocksdbCQDoubleWriteEnable` | false | 是否双写 ConsumeQueue |
 | `indexRocksDBEnable` | false | 是否启用 RocksDB 索引 |
 | `timerRocksDBEnable` | false | 是否启用 RocksDB 延时存储 |
@@ -1168,7 +1181,7 @@ public void recover(final boolean lastExitOK) {
 
 | 场景 | 刷盘策略 | HA 模式 | 存储配置建议 | 原因 |
 |-----|---------|--------|-------------|------|
-| **金融交易** | SYNC_FLUSH | SYNC_MASTER | TransientStorePool 关闭 | 数据零丢失，最高可靠性 |
+| **金融交易** | SYNC_FLUSH | SYNC_MASTER | 配置 `inSyncReplicas > 1` 并监控 ISR | 将本机刷盘和副本 ACK 纳入成功边界 |
 | **日志收集** | ASYNC_FLUSH | ASYNC_MASTER | 开启 TransientStorePool | 高吞吐，允许少量丢失 |
 | **实时计算** | ASYNC_FLUSH | SYNC_MASTER | 开启 TransientStorePool | 平衡可靠性与性能 |
 | **消息堆积** | ASYNC_FLUSH | ASYNC_MASTER | 增大 ConsumeQueue 缓存 | ConsumeQueue 顺序读，堆积不影响性能 |
@@ -1348,16 +1361,16 @@ RocketMQ 事务消息采用两阶段提交（2PC）模式：
 
 ```
 阶段一：Prepare
-    Producer ──发送半消息──→ Broker
-                              │
-                              ↓
-                         CommitLog (标记为半消息)
-                              │
-                              ↓
-                         ConsumeQueue (不构建索引)
-                              │
-                              ↓
-                         Producer ──收到确认──→ 执行本地事务
+    Producer ──发送 prepared 消息──→ Broker
+                                      │
+                                      ↓
+        保存真实 Topic/queueId，事务位重置为 NOT，改写到 Half Topic queue 0
+                                      │
+                                      ↓
+                    CommitLog + Half Topic 的 ConsumeQueue
+                                      │
+                                      ↓
+                         Producer 收到确认后执行本地事务
 
 阶段二：Commit/Rollback
     Producer ──发送提交/回滚指令──→ Broker
@@ -1367,10 +1380,11 @@ RocketMQ 事务消息采用两阶段提交（2PC）模式：
               Commit 成功                          Rollback 成功
                     │                                   │
                     ↓                                   ↓
-               构建 ConsumeQueue 索引            删除半消息或标记为已删除
+      追加一条恢复真实 Topic 的消息             不追加业务消息
                     │                                   │
-                    ↓                                   ↓
-               Consumer 可消费                   Consumer 不可见
+                    └─────────────┬─────────────────────┘
+                                  ↓
+                    向 Op Topic 追加处理标记
 
 阶段三：事务回查
     Broker ──定时扫描超时半消息──→ Producer
@@ -1385,9 +1399,11 @@ RocketMQ 事务消息采用两阶段提交（2PC）模式：
 
 ### 11.2 事务消息存储结构
 
-**半消息标记**：
+**事务标志与 Half Topic**：
 
-半消息通过 `SysFlag` 中的 `TRANSACTION_PREPARED_TYPE` 标志区分：
+Producer 发来的 prepared 消息使用 `TRANSACTION_PREPARED_TYPE`。Broker 的
+`parseHalfMessageInner` 在存储前保存真实 Topic 和 queueId，将事务位重置为
+`TRANSACTION_NOT_TYPE`，再把消息改写到内部 Half Topic：
 
 ```java
 public final static int TRANSACTION_NOT_TYPE = 0;
@@ -1411,11 +1427,15 @@ RocketMQ 使用内部系统 Topic 存储事务消息，而非独立的事务表�
 
 **存储实现**（[TransactionalMessageBridge.java](../broker/src/main/java/org/apache/rocketmq/broker/transaction/queue/TransactionalMessageBridge.java)）：
 
-- 默认半消息写入 `RMQ_SYS_TRANS_HALF_TOPIC`，不构建消费索引，对 Consumer 不可见；当
+- 默认半消息写入 `RMQ_SYS_TRANS_HALF_TOPIC`，并构建这个内部 Topic 的 ConsumeQueue。
+  普通业务 Consumer 看不到它，是因为消息不在业务 Topic，而不是因为没有消费索引。当
   `transRocksDBEnable=true` 且 `transWriteOriginTransHalfEnable=false` 时，改写为
-  `RMQ_SYS_ROCKSDB_TRANS_HALF_TOPIC`，由 RocksDB 事务存储建立索引。
+  `RMQ_SYS_ROCKSDB_TRANS_HALF_TOPIC`，并由 RocksDB 事务存储建立事务索引。
 - 默认 Commit/Rollback 指令写入 `RMQ_SYS_TRANS_OP_HALF_TOPIC`；RocksDB 事务 Topic
   模式对应 `RMQ_SYS_ROCKSDB_TRANS_OP_HALF_TOPIC`。
+- Commit 不会原地修改原 Half 记录，而是追加一条恢复真实 Topic/queueId 的业务消息；
+  Rollback 不追加业务消息。两者都会通过 Op Topic 标记该 Half 消息已处理。原 CommitLog
+  记录保持不可变，最终随文件过期清理。
 
 **RocksDB 存储支持**：
 
@@ -1640,29 +1660,34 @@ Pull 消息时先读取 ConsumeQueue 索引
 
 **存储指标**：
 
-| 指标 | 说明 | 告警阈值参考 |
-|-----|------|-------------|
-| `commitLogDiskRatio` | CommitLog 磁盘使用率 | > 80% |
-| `consumeQueueDiskRatio` | ConsumeQueue 磁盘使用率 | > 80% |
-| `indexDiskRatio` | IndexFile 磁盘使用率 | > 80% |
-| `commitLogFlushTimeSpan` | CommitLog 刷盘耗时 | > 100ms |
-| `haTransferTimeSpan` | HA 复制耗时 | > 500ms |
+| Broker Runtime Key | 说明 |
+|-----|------|
+| `commitLogDiskRatio` | CommitLog 所在磁盘使用率 |
+| `consumeQueueDiskRatio` | ConsumeQueue 所在磁盘使用率 |
+| `dispatchBehindBytes` | CommitLog 尚未分发到消费索引的字节数 |
+| `commitLogMaxOffset` / `commitLogMinOffset` | CommitLog 有效物理偏移范围 |
 
 **写入指标**：
 
-| 指标 | 说明 | 告警阈值参考 |
-|-----|------|-------------|
-| `putMessageTPS` | 消息写入 TPS | 根据业务预期 |
-| `putMessageSize` | 消息写入大小 | 根据业务预期 |
-| `putMessageLatency` | 消息写入延迟 | P99 > 100ms |
+| Broker Runtime Key | 说明 |
+|-----|------|
+| `putTps` | 近期消息写入 TPS |
+| `putMessageTimesTotal` / `putMessageFailedTimes` | 累计写入与失败次数 |
+| `putMessageSizeTotal` | 累计写入字节数 |
+| `putLatency99` / `putLatency999` | 写入耗时 P99/P99.9 |
+| `putMessageEntireTimeMax` | 统计窗口内最大写入耗时 |
 
 **读取指标**：
 
-| 指标 | 说明 | 告警阈值参考 |
-|-----|------|-------------|
-| `getMessageTPS` | 消息读取 TPS | 根据业务预期 |
-| `getMessageLatency` | 消息读取延迟 | P99 > 200ms |
-| `pullMessageLatency` | 拉取消息延迟 | P99 > 500ms |
+| Broker Runtime Key | 说明 |
+|-----|------|
+| `getFoundTps` / `getMissTps` / `getTotalTps` | 拉取命中、未命中和总 TPS |
+| `getTransferredTps` | 实际传输给客户端的消息 TPS |
+| `getMessageEntireTimeMax` | 统计窗口内最大读取耗时 |
+
+这些名称来自当前 `StoreStatsService#getRuntimeInfo()` 和 `DefaultMessageStore#getRuntimeInfo()`，
+可通过 `mqadmin brokerStatus` 查看。告警阈值应按磁盘容量、消息大小和业务 SLO 建立基线，
+源码没有通用的固定 P99 告警线。
 
 ### 14.2 性能调优建议
 

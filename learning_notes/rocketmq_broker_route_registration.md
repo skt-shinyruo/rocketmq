@@ -511,7 +511,8 @@ topicQueueMappingInfoTable = {
 
 1. 将 `brokerName` 加入 `clusterAddrTable[clusterName]`。
 2. 首次出现该 `brokerName` 时创建 `BrokerData`。
-3. 更新 `enableActingMaster` 和 `zoneName`。
+3. 更新 `enableActingMaster` 和复制组级的 `zoneName`。`zoneName` 保存在 `BrokerData`，
+   不是每个 Master/Slave 地址各自独立的字段；同一 `brokerName` 的实例应上报相同值。
 4. 将 `brokerId -> brokerAddr` 写入复制组地址表。
 
 同一地址由 Slave 切换为 Master 时，代码先删除该地址对应的旧 `brokerId`，保证一个地址

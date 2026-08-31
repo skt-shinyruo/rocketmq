@@ -103,9 +103,11 @@ rebalance 后新接管一个队列时，先查 Broker 端该队列上次消费�
 
 ### 6. UPDATE_CONSUMER_OFFSET（15）→ Broker，Timer: 5S
 
-消费成功后位点**先更新内存**（`OffsetStore.updateOffset`），再由 5s 定时任务
-`persistAllConsumerOffset()`（`MQClientInstance.java:562`）批量刷到 Broker。
-**位点提交不是每条消息消费完就发一次 RPC**，因此重复消费的窗口约为 5 秒。
+消费成功后位点**先更新内存**（`OffsetStore.updateOffset`），再由
+`persistAllConsumerOffset()` 批量刷到 Broker。当前任务首次约 10 秒后运行，之后默认每 5
+秒运行一次（`MQClientInstance.java:369-375`）。**位点提交不是每条消息消费完就发一次 RPC**，
+因此正常情况下会有数秒重复消费窗口；进程崩溃、网络故障或持久化失败时窗口可能更长，5 秒
+不是上限。
 
 ### 7. UNREGISTER_CLIENT（35）→ 仅 Broker
 
@@ -119,10 +121,10 @@ rebalance 后新接管一个队列时，先查 Broker 端该队列上次消费�
 
 1. **NameServer 参与度极低**：全图只有第 1 步经过它。路由元数据在 NameServer，
    消息与消费状态全在 Broker 侧闭环，NameServer 无状态、互不通信的设计得以成立。
-2. **三个 Timer 各司其职**：30s 保路由新鲜，20s 保队列分配均衡，5s 保位点持久化；
-   日常运维说的"消费者最多 20s 完成一次扩缩容再平衡"就来自中间那个。
-3. **两段式位点提交**：内存即时更新 + 5s 批量持久化，用 5 秒的重复消费窗口换掉了
-   每条消息一次的 RPC 开销，`at-least-once` 语义由此而来。
+2. **三个 Timer 各司其职**：约 30s 保路由新鲜，Rebalance 周期用于检查队列分配，位点任务
+   首次约 10s 后、默认每 5s 持久化；这些是调度周期，不是故障场景下的严格完成上限。
+3. **两段式位点提交**：内存即时更新 + 定时批量持久化，用正常情况下数秒的重复消费窗口
+   换掉了每条消息一次的 RPC 开销，`at-least-once` 语义由此而来。
 4. **分配在客户端、组员名单在 Broker**：Broker 只回答"组里有哪些人"，"谁消费哪些
    队列"由每个消费者独立计算，Broker 不做集中分配——这是无 master 协调的
    去中心化 rebalance。

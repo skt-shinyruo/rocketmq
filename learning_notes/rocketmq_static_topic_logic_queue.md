@@ -26,7 +26,7 @@
 如果 Topic 只有一条队伍，所有消息排一队，读写只能串行，吞吐量太低。所以把 Topic
 横向切成 N 个队列（Kafka 叫 Partition，RocketMQ 叫 Queue），不同队列可以：
 
-- 分布在**不同的机器**上 → 存储容量和吞吐量随机器数扩展；
+- 可以分布在**不同的 Broker 复制组**上 → 存储容量和吞吐量可以随 Broker 扩展；
 - 被**并行**读写 → 生产者同时往多个队列写，消费者同时从多个队列拉。
 
 这个"队列"就是系统的**并行单元和分布单元**。本文所有讨论都围绕一个问题：
@@ -34,9 +34,11 @@
 
 ### 1.3 队列的本质是磁盘上的文件
 
-这是最容易被忽略的一点：**队列不是抽象概念，它就是某台机器硬盘上的文件。**
+这是最容易被忽略的一点：**MessageQueue 是逻辑标识，传统模式下它绑定某个 Broker 的
+本地存储视图。**
 
-- RocketMQ：每个队列对应一个 ConsumeQueue 索引文件 + CommitLog 里的数据段；
+- RocketMQ：每个 `(brokerName, queueId)` 对应一个 ConsumeQueue 索引目录，消息主体仍共享
+  Broker 的 CommitLog；
 - Kafka：每个 partition 对应磁盘上一个目录，里面是一段一段的 log 文件。
 
 所以"把队列从 A 机器搬到 B 机器"永远意味着一件事：
@@ -169,7 +171,7 @@ Kafka 的"安全"只覆盖机器层面的扩缩容；一旦主动修改 partitio
 
 | 变更操作 | Kafka | RocketMQ 传统模式 |
 | --- | --- | --- |
-| 加/减**机器** | 无影响（reassignment 只搬 replica） | 必然改 N，映射重排 |
+| 加/减**机器** | 无影响（reassignment 只搬 replica） | 不会自动改已有 Topic 的 N；若为了使用新 Broker 给 Topic 新建队列，则总队列数和映射会变 |
 | 改**分片数** | 同样破坏 key 映射和顺序性 | 同样（本来就是靠改队列数来适配机器变化） |
 
 也就是说，**`hash(key) mod N` 这个公式对 N 的任何变化都敏感，与系统无关**。
@@ -177,8 +179,9 @@ Kafka 的"安全"只覆盖机器层面的扩缩容；一旦主动修改 partitio
 
 - **Kafka 把"改 N"变成一个显式的、用户主动发起的决定**——机器增减不会碰它，
   你想清楚后果了才去改；
-- **RocketMQ 传统模式把"改 N"和"加机器"焊在一起**——你只是想扩个容，
-  N 却被迫跟着变，破坏映射成了扩容的副作用。
+- **RocketMQ 传统模式没有把机器位置与全局逻辑队列解耦**——新增 Broker 本身不会自动
+  改 Topic，但要让它承载传统 Topic，通常需要创建新的 `(brokerName, queueId)` 队列，
+  这会使队列集合或队列总数发生变化。
 
 ---
 
@@ -186,7 +189,9 @@ Kafka 的"安全"只覆盖机器层面的扩缩容；一旦主动修改 partitio
 
 ### 4.1 架构决定
 
-RocketMQ 的作者做了一个截然相反的决定：**不引入任何中心化的仲裁组件。**
+传统 NameServer 路由模式不引入用于 Topic 队列归属的中心化共识仲裁组件。RocketMQ 5.x
+另有 Controller/DLedger 负责 Broker 角色或副本选举，但它们不等于一个通用的 Topic 队列
+迁移元数据中心。
 
 NameServer 设计成：
 
@@ -200,7 +205,7 @@ NameServer 设计成：
 这意味着：**"队列归谁"这个事实，是由持有它的 Broker 自己声明的，
 没有任何第三方校验。**
 
-换来的是巨大的简单性：没有共识协议、没有选主、NameServer 挂一台无所谓
+换来的是巨大的简单性：传统路由层不做 Topic 队列迁移共识，NameServer 挂一台无所谓
 （客户端会试下一台）、运维极其轻量。代价是：**元数据只是"最终大致正确"的快照，
 不是强一致的账本。**
 
@@ -209,7 +214,8 @@ NameServer 设计成：
 在没有仲裁者的前提下，想把"队列 3"从 Broker-A 搬到 Broker-B，
 会遇到一连串无解的问题：
 
-1. **谁来宣布归属变更？** 没有 Controller。只能靠 Broker 自己声明。
+1. **谁来宣布归属变更？** 传统 Topic 路由没有一个负责队列迁移的统一元数据事务，只能
+   依靠 Broker 注册和管理命令改变路由。
    切换瞬间，A 说"3 还在我这"，B 说"3 归我了"——两份心跳各自上报到不同的
    NameServer，客户端从不同 NameServer 会拿到**互相矛盾的路由**。
 2. **切换瞬间的写入给谁？** Producer 可能正写到 A，路由突然变成 B，
@@ -236,7 +242,7 @@ RocketMQ 的 Broker 并不孤立——有 Master/Slave 主从复制，
 | | 数据复制 | 元数据仲裁 |
 | --- | --- | --- |
 | Kafka | Broker 间互拉 ✓ | ZK/KRaft 单点裁决 ✓ |
-| RocketMQ | Master→Slave / DLedger ✓ | ✗ 无。NameServer 无状态、彼此不通信、只被动记录心跳 |
+| RocketMQ 传统 Topic 路由 | Master→Slave / DLedger ✓ | ✗ 无通用的 Topic 队列迁移账本；Controller/DLedger 的选主能力不替代它 |
 
 两者的差别不在"会不会复制数据"（都会），而在于：
 **Kafka 有一个强一致的元数据中心来裁决"每个分片此刻归谁、谁是 leader"，
@@ -640,7 +646,7 @@ graph TD
     K --> K2["迁移只改账本不动编号<br/>矛盾不存在"]
 
     CONFLICT -->|"RocketMQ 传统"| M["无仲裁者, NameServer 只记录<br/>队列身份=(brokerName, queueId), 绑死位置"]
-    M --> M2["扩容只能新建队列 → N 变化<br/>矛盾必然发生"]
+    M --> M2["要让新 Broker 承载传统 Topic 通常需新队列<br/>队列集合/N 变化"]
 
     M2 --> S["Static Topic:<br/>逻辑编号做身份 + 映射表 + epoch 切换协议<br/>应用层补回 K2 的能力"]
 ```
@@ -652,7 +658,8 @@ graph TD
 2. **Kafka 为什么没这个问题**：有 ZK/KRaft 做单点裁决，partition 身份是全局逻辑编号，
    与存放位置解耦，迁移只是改账本。（但主动改分区数同样破坏映射，
    且只能加不能减。）
-3. **RocketMQ 传统模式为什么有这个问题**：NameServer 只记录不仲裁，
+3. **RocketMQ 传统模式为什么有这个问题**：NameServer 只记录传统 Topic 路由，不提供
+   队列迁移事务；Controller/DLedger 的副本选主不改变这一点，
    队列身份含 brokerName，位置即身份，换宿主即换身份。
 4. **Static Topic 怎么解决**：全局逻辑队列编号做身份 + 可动态修改的映射表 +
    epoch 多步切换协议，让扩缩容变成纯粹的映射表变更，

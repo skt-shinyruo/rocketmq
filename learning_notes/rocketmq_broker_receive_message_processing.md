@@ -69,7 +69,7 @@ public boolean rejectRequest() {
     if (!enableSlaveActingMaster && brokerRole == BrokerRole.SLAVE) {
         return true;
     }
-    // 条件2：OS 页缓存忙（写入压力过大）
+    // 条件2：CommitLog 写入临界区卡顿，或 transient store pool 缓冲不足
     if (getMessageStore().isOSPageCacheBusy()
         || getMessageStore().isTransientStorePoolDeficient()) {
         return true;
@@ -82,12 +82,11 @@ public boolean rejectRequest() {
 
 - **条件 1**：消息必须写到 Master 的 CommitLog，Slave 只负责读和备份。不拦截的话，
   消息到了 Slave 才发现写不了，已经浪费了解码、线程池调度、Hook 等开销。
-- **条件 2**：消息写入依赖 OS page cache（先写内存页再异步刷盘）。写入速度远超刷盘
-  速度时 page cache 变脏变满，继续接收只会导致写入延迟暴涨甚至 OOM。
-  `isOSPageCacheBusy()` 通过最近一次写入 lock 时间是否超过阈值判断
-  （默认 `osPageCacheBusyTimeOutMills=1000ms`）；transient store pool 耗尽说明
-  开启读写分离时刷盘跟不上写入。主动拒绝一部分流量是背压（backpressure）思想，
-  保护 Broker 自身和已接受的请求。
+- **条件 2**：`isOSPageCacheBusy()` 实际比较的是 CommitLog 写锁的持续时间
+  （默认 `osPageCacheBusyTimeOutMills=1000ms`），并不读取 page cache 的脏页数量或磁盘
+  使用率。长时间持锁可能由 page fault、磁盘 IO 或其他写入停顿造成，因此它是写入临界区
+  卡顿的代理信号，不是“page cache 已满”或“即将 OOM”的直接检测。
+  `transientStorePool` 缓冲耗尽则是另一条独立的背压条件。
 
 两种方式的对比：
 
@@ -273,7 +272,8 @@ CONSUMER_SEND_MSG_BACK
 6. **复制**：
    - 主从同步复制：等待 Slave 拉取确认；
    - 异步复制（默认）：不等 Slave；
-   - DLedger/Controller 模式：按多数派 ACK。
+   - DLedger：按 Raft 提交规则等待所需副本；Controller 模式：按 `inSyncReplicas`、
+     `minInSyncReplicas`、`allAckInSyncStateSet` 等配置决定 ACK 边界，不固定等于多数派。
 
 注意：`asyncPutMessage` 名字里的 async 只针对刷盘/复制的 future 与响应续接；
 编码和内存 append 仍在 Broker 发送线程同步完成。

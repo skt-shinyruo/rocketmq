@@ -20,5 +20,6 @@
 - [RocketMQ IndexFile 工作原理](rocketmq_indexfile.md)
 - [RocketMQ 静态主题（Static Topic / Logic Queue）](rocketmq_static_topic_logic_queue.md)
 - [RocketMQ 本地源码 Debug](rocketmq_local_source_debug.md)
+- [RocketMQ Consumer 生命周期与时序](rocketmq_consumer_lifecycle_sequence.md)
 - [RocketMQ DefaultMQPushConsumer Pull 消费流程分析](consumer_flow_analysis.md)
 - [Push 并发消费：位点提交、重试与死信](rocketmq_concurrent_consume_offset.md)

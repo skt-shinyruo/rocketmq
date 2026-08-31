@@ -39,7 +39,8 @@ for (int i = 0; i < qd.getReadQueueNums(); i++) {
 
 ## 本质：同一套存储的两个视角
 
-底层存储（CommitLog / ConsumeQueue）只有一套，queueId 0~N 是共享的。read/write queue nums 只是客户端视角的"可见范围"，不影响 Broker 实际建多少个 ConsumeQueue 文件：
+底层存储（CommitLog / ConsumeQueue）只有一套，queueId 0~N 是共享的。read/write queue nums
+是路由元数据中的可见范围，不会自动创建、删除或重新分片 Broker 上的 ConsumeQueue 文件：
 
 ```mermaid
 graph LR
@@ -59,9 +60,11 @@ graph LR
 
 ### 1. 优雅下线 Broker（最常用）
 
-要把某台 Broker 摘掉时，先把它的 write 队列数改成 0（或把 perm 改成只读）：
+要把某台 Broker 摘掉时，通常先把它的 write 队列数改成 0，并把 perm/客户端路由作为辅助
+控制手段：
 
-- Producer 立刻不再往它发新消息；
+- 新路由收敛后 Producer 不再选择它的写队列；旧路由和在途请求仍可能继续到达，不能把
+  `writeQueueNums=0` 当作服务端硬停写栅栏；
 - Consumer 还能继续把它上面积压的消息消费完；
 - 等积压清零，再把 read 队列数改成 0，最后下线。
 
@@ -69,7 +72,8 @@ graph LR
 
 ### 2. 独立扩缩容
 
-- 想提升消费吞吐：加消费者、加 read 队列数让 Rebalance 分得更开，不影响生产链路；
+- 想提升消费吞吐：优先加消费者；只有目标 queueId 已存在且有数据、此前被 read 范围隐藏时，
+  增大 read 队列数才会让 Rebalance 纳入更多队列。它不会把已有消息重新分片；
 - 想临时限制生产端：缩小 write 队列数即可。
 
 两个方向的操作互不干扰。
@@ -91,7 +95,9 @@ graph LR
 - Consumer 永远看不到这些队列；
 - 消息会无限积压且无法消费。
 
-所以运维上改这两个数要成对操作，只在上面说的过渡场景（下线 Broker、灰度迁移）里才故意让它们短暂不一致。
+所以运维上改这两个数要结合消息流向操作：下线或迁移时可以暂时 `write=0, read>0` 先停
+新路由、再排干存量；普通 Topic 长期应让读范围覆盖所有实际写入的 queueId。修改后还要
+等待客户端路由刷新，并观察实际写入 TPS，而不能仅凭命令返回成功判断已经生效。
 
 ## 相关笔记
 

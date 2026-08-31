@@ -21,8 +21,9 @@ sequenceDiagram
     B-->>P: SEND_RESULT + SendMessageResponseHeader
 
     Note over P,B: 仅事务消息
-    B-->>P: 半消息回查触发本地事务
+    Note over P: Half Message 成功后执行本地事务
     P->>B: END_TRANSACTION (37, ONEWAY)
+    B-->>P: 事务状态未知/超时时再发 CHECK_TRANSACTION_STATE
 
     Note over P,B: 客户端后台线程（与单次发送无关）
     P->>B: HEART_BEAT (34) 每30s
@@ -31,7 +32,9 @@ sequenceDiagram
 ## 1. 发送前：与 NameServer 的通信
 
 - `GET_ROUTEINFO_BY_TOPIC`（105）：本地路由缓存不存在/过期时，由 `tryToFindTopicPublishInfo` 触发。消息正文**不经过** NameServer。
-- 若 topic 不存在且允许自动创建，会先发一条到系统默认 topic `TBW102` 所在 Broker。
+- 若业务 Topic 路由不存在，客户端会查询默认 Topic `TBW102` 的路由来选择候选 Broker，
+  但发送请求中的 Topic 仍是业务 Topic。Broker 收到请求后依据 `TBW102` 配置创建业务
+  Topic；不会先向 `TBW102` 发送一条消息。
 
 ## 2. 核心：与 Broker 的发送通信
 
@@ -43,7 +46,9 @@ sequenceDiagram
 | ASYNC | `invokeAsync` + `SendCallback` | 同上 |
 | ONEWAY | `invokeOneway` | 同上，无响应 |
 
-- 请求体：`SendMessageRequestHeader`（topic、queueId、sysFlag、bornTimestamp、UNIQ_KEY 等）+ 消息 body；批量消息走 `SEND_BATCH_MESSAGE`(320)/V2。
+- 请求体：`SendMessageRequestHeader`（topic、queueId、sysFlag、bornTimestamp、序列化后的
+  properties 等）+ 消息 body；`UNIQ_KEY` 位于 properties 字符串中。批量消息走
+  `SEND_BATCH_MESSAGE`(320)/V2。
 - 响应：`SendResult`（含 `msgId`——客户端生成的 UNIQ_KEY，以及 `offsetMsgId`——Broker 生成的物理 offset id、`queueOffset`——CommitLog 分配的队列偏移）。
 - 重试边界：SYNC 默认重试 2 次、共尝试 3 次（`retryTimesWhenSendFailed=2`，每次重新选队列，可能换 Broker）；ASYNC 在 remoting 层失败时也可换 Broker 重试（`retryTimesWhenSendAsyncFailed=2`）；ONEWAY 无任何重试与结果。
 
